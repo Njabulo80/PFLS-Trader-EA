@@ -5,22 +5,15 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| ENTRY ENGINE                                                     |
-//| Version 2.00.2                                                   |
+//| Version 2.00.3                                                   |
 //|                                                                  |
-//| ENTRY HYPOTHESIS                                                 |
-//| 1. Price Flow identifies a directional objective.               |
-//| 2. A separate fresh M5 retracement zone is identified.           |
-//| 3. Price interacts with that M5 zone.                             |
-//| 4. A rejection candle forms at the M5 zone.                       |
-//| 5. The following completed candle breaks the rejection candle.   |
-//| 6. M5 market structure must support the candidate.               |
-//|                                                                  |
-//| Research only. No order placement.                               |
+//| Research-only entry hypothesis.                                 |
+//| No order placement.                                              |
 //+------------------------------------------------------------------+
 
 #include "PFLS_PriceFlow.mqh"
 
-#define PFLS_ENTRY_MODULE_VERSION "2.00.2"
+#define PFLS_ENTRY_MODULE_VERSION "2.00.3"
 
 //====================================================================
 // SIGNAL TYPES
@@ -62,6 +55,7 @@ struct PFLS_EntryResult
    ENUM_TIMEFRAMES   objective_timeframe;
    double            objective_upper;
    double            objective_lower;
+   bool              objective_is_supply;
 
    string            explanation;
 };
@@ -94,6 +88,7 @@ void PFLS_ResetEntryResult(PFLS_EntryResult &result)
    result.objective_timeframe = PERIOD_CURRENT;
    result.objective_upper = 0.0;
    result.objective_lower = 0.0;
+   result.objective_is_supply = false;
 
    result.explanation = "NO CONFIRMED ENTRY CANDIDATE";
 }
@@ -161,14 +156,20 @@ bool PFLS_IsSeparateM5EntryZone(
    if(entry_zone.timeframe != PERIOD_M5)
       return false;
 
+   if(entry_zone.upper <= entry_zone.lower)
+      return false;
+
    if(!PFLS_IsZoneFresh(entry_zone))
       return false;
 
    if(!flow.objective.valid)
       return false;
 
-   // The M5 entry zone must be separate from the objective.
-   // Overlapping price ranges are not accepted as separate zones.
+   if(flow.objective.upper <= flow.objective.lower)
+      return false;
+
+   // Entry and objective must be separate price areas.
+   // Overlap and exact boundary contact are rejected.
 
    double overlap_upper = MathMin(
       entry_zone.upper,
@@ -180,12 +181,7 @@ bool PFLS_IsSeparateM5EntryZone(
       flow.objective.lower
    );
 
-   if(overlap_upper > overlap_lower)
-      return false;
-
-   // Reject exact boundary contact as well.
-   if(entry_zone.upper == flow.objective.lower ||
-      entry_zone.lower == flow.objective.upper)
+   if(overlap_upper >= overlap_lower)
       return false;
 
    return true;
@@ -306,7 +302,8 @@ bool PFLS_EntryStructureSupportsSell(
 }
 
 //====================================================================
-// OBJECTIVE DIRECTION FILTER
+// BUY OBJECTIVE VALIDATION
+// BUY MUST TARGET SUPPLY ABOVE CURRENT PRICE
 //====================================================================
 
 bool PFLS_EntryObjectiveSupportsBuy(
@@ -320,7 +317,8 @@ bool PFLS_EntryObjectiveSupportsBuy(
       flow.objective.status == PFLS_OBJECTIVE_OBSERVATION_ONLY)
       return false;
 
-   if(flow.objective.is_supply)
+   // Correct direction: BUY targets supply.
+   if(!flow.objective.is_supply)
       return false;
 
    if(flow.d1_bias != PFLS_DIRECTION_BULLISH)
@@ -329,11 +327,19 @@ bool PFLS_EntryObjectiveSupportsBuy(
    if(!flow.directional_objective_allowed)
       return false;
 
+   if(flow.current_price <= 0.0)
+      return false;
+
+   // Supply objective must be above current price.
+   if(flow.objective.lower <= flow.current_price)
+      return false;
+
    return true;
 }
 
 //====================================================================
-// OBJECTIVE DIRECTION FILTER
+// SELL OBJECTIVE VALIDATION
+// SELL MUST TARGET DEMAND BELOW CURRENT PRICE
 //====================================================================
 
 bool PFLS_EntryObjectiveSupportsSell(
@@ -347,13 +353,21 @@ bool PFLS_EntryObjectiveSupportsSell(
       flow.objective.status == PFLS_OBJECTIVE_OBSERVATION_ONLY)
       return false;
 
-   if(!flow.objective.is_supply)
+   // Correct direction: SELL targets demand.
+   if(flow.objective.is_supply)
       return false;
 
    if(flow.d1_bias != PFLS_DIRECTION_BEARISH)
       return false;
 
    if(!flow.directional_objective_allowed)
+      return false;
+
+   if(flow.current_price <= 0.0)
+      return false;
+
+   // Demand objective must be below current price.
+   if(flow.objective.upper >= flow.current_price)
       return false;
 
    return true;
@@ -378,10 +392,7 @@ bool PFLS_EvaluateBuyCandidate(
    if(timeframe != PERIOD_M5)
       return false;
 
-   if(total < 4)
-      return false;
-
-   if(minimum_wick_ratio <= 0.0)
+   if(total < 4 || minimum_wick_ratio <= 0.0)
       return false;
 
    if(!demand_zone.active || !demand_zone.is_demand)
@@ -398,8 +409,8 @@ bool PFLS_EvaluateBuyCandidate(
 
    // Series indexing:
    // rates[2] = completed rejection candle
-   // rates[1] = following completed confirmation candle
-   // rates[0] = currently forming candle
+   // rates[1] = completed confirmation candle
+   // rates[0] = current forming candle
 
    const MqlRates rejection = rates[2];
    const MqlRates confirmation = rates[1];
@@ -413,11 +424,14 @@ bool PFLS_EvaluateBuyCandidate(
    if(confirmation.time <= rejection.time)
       return false;
 
-   // Confirmation must close above rejection high.
    if(confirmation.close <= rejection.high)
       return false;
 
    if(confirmation.close <= confirmation.open)
+      return false;
+
+   // Candidate must remain below the supply objective.
+   if(flow.objective.lower <= confirmation.close)
       return false;
 
    result.valid = true;
@@ -443,11 +457,12 @@ bool PFLS_EvaluateBuyCandidate(
    result.objective_timeframe = flow.objective.source_timeframe;
    result.objective_upper = flow.objective.upper;
    result.objective_lower = flow.objective.lower;
+   result.objective_is_supply = flow.objective.is_supply;
 
    result.explanation =
       "Bullish D1 bias + separate fresh M5 demand retracement "
       "+ bullish rejection + next completed candle breakout "
-      "+ bullish M5 structure";
+      "+ bullish M5 structure + supply objective above entry";
 
    return true;
 }
@@ -471,10 +486,7 @@ bool PFLS_EvaluateSellCandidate(
    if(timeframe != PERIOD_M5)
       return false;
 
-   if(total < 4)
-      return false;
-
-   if(minimum_wick_ratio <= 0.0)
+   if(total < 4 || minimum_wick_ratio <= 0.0)
       return false;
 
    if(!supply_zone.active || supply_zone.is_demand)
@@ -501,11 +513,14 @@ bool PFLS_EvaluateSellCandidate(
    if(confirmation.time <= rejection.time)
       return false;
 
-   // Confirmation must close below rejection low.
    if(confirmation.close >= rejection.low)
       return false;
 
    if(confirmation.close >= confirmation.open)
+      return false;
+
+   // Candidate must remain above the demand objective.
+   if(flow.objective.upper >= confirmation.close)
       return false;
 
    result.valid = true;
@@ -531,11 +546,12 @@ bool PFLS_EvaluateSellCandidate(
    result.objective_timeframe = flow.objective.source_timeframe;
    result.objective_upper = flow.objective.upper;
    result.objective_lower = flow.objective.lower;
+   result.objective_is_supply = flow.objective.is_supply;
 
    result.explanation =
       "Bearish D1 bias + separate fresh M5 supply retracement "
       "+ bearish rejection + next completed candle breakout "
-      "+ bearish M5 structure";
+      "+ bearish M5 structure + demand objective below entry";
 
    return true;
 }
@@ -593,8 +609,7 @@ bool PFLS_EvaluateEntry(
    {
       result.signal = PFLS_ENTRY_AMBIGUOUS;
       result.explanation =
-         "Conflicting buy and sell candidates. "
-         "No candidate selected.";
+         "Conflicting buy and sell candidates. No candidate selected.";
 
       return false;
    }
