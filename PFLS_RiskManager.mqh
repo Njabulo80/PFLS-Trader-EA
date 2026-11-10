@@ -5,32 +5,26 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| RISK MANAGEMENT MODULE                                           |
-//| Version 2.00.1                                                   |
+//| Version 2.00.2                                                   |
 //|                                                                  |
-//| Responsibilities:                                                |
-//| - Risk configuration                                             |
-//| - Position volume calculation                                    |
-//| - Stop-loss calculation                                          |
-//| - Take-profit validation                                         |
-//| - Risk/reward validation                                         |
-//| - Daily trade limit                                              |
-//| - Emergency execution lock                                       |
-//|                                                                  |
-//| Research module. No order placement.                             |
+//| Risk calculations and validation only.                           |
+//| No order placement.                                              |
 //+------------------------------------------------------------------+
 
-#define PFLS_RISK_MODULE_VERSION "2.00.1"
+#include "PFLS_EntryEngine.mqh"
+
+#define PFLS_RISK_MODULE_VERSION "2.00.2"
 
 //====================================================================
 // DEFAULT RISK SETTINGS
 //====================================================================
 
-#define PFLS_DEFAULT_FIXED_LOT       0.01
-#define PFLS_DEFAULT_MAX_RISK        3.0
-#define PFLS_DEFAULT_MAX_DAILY_TRADES 2
-#define PFLS_DEFAULT_MIN_RR          1.2
-#define PFLS_DEFAULT_STOP_BUFFER     20
-#define PFLS_DEFAULT_MAGIC_NUMBER    751103
+#define PFLS_DEFAULT_FIXED_LOT          0.01
+#define PFLS_DEFAULT_MAX_RISK           3.0
+#define PFLS_DEFAULT_MAX_DAILY_TRADES   2
+#define PFLS_DEFAULT_MIN_RR             1.2
+#define PFLS_DEFAULT_STOP_BUFFER        20
+#define PFLS_DEFAULT_MAGIC_NUMBER       751103
 
 //====================================================================
 // RISK CONFIGURATION
@@ -87,24 +81,13 @@ struct PFLS_TradePlan
 void PFLS_ResetRiskConfig(PFLS_RiskConfig &config)
 {
    config.fixed_lot = PFLS_DEFAULT_FIXED_LOT;
-
-   config.maximum_risk_percent =
-      PFLS_DEFAULT_MAX_RISK;
-
-   config.maximum_daily_trades =
-      PFLS_DEFAULT_MAX_DAILY_TRADES;
-
-   config.minimum_risk_reward =
-      PFLS_DEFAULT_MIN_RR;
-
-   config.stop_buffer_points =
-      PFLS_DEFAULT_STOP_BUFFER;
-
-   config.magic_number =
-      PFLS_DEFAULT_MAGIC_NUMBER;
+   config.maximum_risk_percent = PFLS_DEFAULT_MAX_RISK;
+   config.maximum_daily_trades = PFLS_DEFAULT_MAX_DAILY_TRADES;
+   config.minimum_risk_reward = PFLS_DEFAULT_MIN_RR;
+   config.stop_buffer_points = PFLS_DEFAULT_STOP_BUFFER;
+   config.magic_number = PFLS_DEFAULT_MAGIC_NUMBER;
 
    config.execution_enabled = false;
-
    config.emergency_stop = false;
 }
 
@@ -126,7 +109,6 @@ void PFLS_ResetTradePlan(PFLS_TradePlan &plan)
    plan.target_distance = 0.0;
 
    plan.risk_reward = 0.0;
-
    plan.volume = 0.0;
 
    plan.estimated_risk_money = 0.0;
@@ -136,7 +118,7 @@ void PFLS_ResetTradePlan(PFLS_TradePlan &plan)
 }
 
 //====================================================================
-// CHECK CONFIGURATION
+// VALIDATE CONFIGURATION
 //====================================================================
 
 bool PFLS_ValidateRiskConfig(
@@ -149,7 +131,8 @@ bool PFLS_ValidateRiskConfig(
       config.maximum_risk_percent > 3.0)
       return false;
 
-   if(config.maximum_daily_trades < 1)
+   if(config.maximum_daily_trades < 1 ||
+      config.maximum_daily_trades > 2)
       return false;
 
    if(config.minimum_risk_reward < 1.2)
@@ -158,23 +141,73 @@ bool PFLS_ValidateRiskConfig(
    if(config.stop_buffer_points < 0)
       return false;
 
+   if(config.magic_number == 0)
+      return false;
+
    return true;
 }
 
 //====================================================================
-// CHECK EXECUTION PERMISSION
+// EXECUTION PERMISSION
 //====================================================================
 
 bool PFLS_RiskExecutionAllowed(
    const PFLS_RiskConfig &config)
 {
-   if(!config.execution_enabled)
-      return false;
+   // Research build: execution is permanently denied here.
+   return false;
+}
 
-   if(config.emergency_stop)
-      return false;
+//====================================================================
+// PRICE NORMALISATION
+//====================================================================
 
-   return true;
+double PFLS_RiskNormalisePrice(
+   const string symbol,
+   const double price,
+   const bool round_up)
+{
+   double tick_size =
+      SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   int digits =
+      (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+   if(tick_size <= 0.0)
+      tick_size = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   if(tick_size <= 0.0 || price <= 0.0)
+      return 0.0;
+
+   double steps = price / tick_size;
+
+   double rounded_steps;
+
+   if(round_up)
+      rounded_steps = MathCeil(steps - 0.00000001);
+   else
+      rounded_steps = MathFloor(steps + 0.00000001);
+
+   return NormalizeDouble(
+      rounded_steps * tick_size,
+      digits
+   );
+}
+
+//====================================================================
+// VOLUME PRECISION
+//====================================================================
+
+int PFLS_RiskVolumeDigits(const double step)
+{
+   for(int digits = 0; digits <= 8; digits++)
+   {
+      if(MathAbs(step * MathPow(10.0, digits) -
+                 MathRound(step * MathPow(10.0, digits))) < 0.00000001)
+         return digits;
+   }
+
+   return 8;
 }
 
 //====================================================================
@@ -185,6 +218,9 @@ double PFLS_NormaliseVolume(
    const string symbol,
    const double requested_volume)
 {
+   if(requested_volume <= 0.0)
+      return 0.0;
+
    double minimum_volume =
       SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
 
@@ -205,26 +241,23 @@ double PFLS_NormaliseVolume(
    double capped_volume =
       MathMin(requested_volume, maximum_volume);
 
-   double steps =
-      MathFloor((capped_volume - minimum_volume) /
-                volume_step + 0.00000001);
+   double steps = MathFloor(
+      (capped_volume - minimum_volume) / volume_step
+      + 0.00000001
+   );
 
    double normalised =
       minimum_volume + steps * volume_step;
 
-   int volume_digits = 0;
+   int digits = PFLS_RiskVolumeDigits(volume_step);
 
-   double step_check = volume_step;
+   normalised = NormalizeDouble(normalised, digits);
 
-   while(volume_digits < 8 &&
-         MathAbs(step_check -
-         MathRound(step_check)) > 0.00000001)
-   {
-      step_check *= 10.0;
-      volume_digits++;
-   }
+   if(normalised < minimum_volume ||
+      normalised > maximum_volume)
+      return 0.0;
 
-   return NormalizeDouble(normalised, volume_digits);
+   return normalised;
 }
 
 //====================================================================
@@ -242,6 +275,9 @@ bool PFLS_CalculateStopLoss(
    if(!entry.valid)
       return false;
 
+   if(entry.zone_upper <= entry.zone_lower)
+      return false;
+
    double point =
       SymbolInfoDouble(symbol, SYMBOL_POINT);
 
@@ -253,29 +289,40 @@ bool PFLS_CalculateStopLoss(
 
    if(entry.signal == PFLS_ENTRY_BUY_CANDIDATE)
    {
-      stop_loss = entry.zone_lower - buffer;
+      double raw_stop = entry.zone_lower - buffer;
 
-      if(stop_loss >= entry.candidate_price)
-         return false;
+      stop_loss = PFLS_RiskNormalisePrice(
+         symbol,
+         raw_stop,
+         false
+      );
 
-      return true;
+      return (
+         stop_loss > 0.0 &&
+         stop_loss < entry.candidate_price
+      );
    }
 
    if(entry.signal == PFLS_ENTRY_SELL_CANDIDATE)
    {
-      stop_loss = entry.zone_upper + buffer;
+      double raw_stop = entry.zone_upper + buffer;
 
-      if(stop_loss <= entry.candidate_price)
-         return false;
+      stop_loss = PFLS_RiskNormalisePrice(
+         symbol,
+         raw_stop,
+         true
+      );
 
-      return true;
+      return (
+         stop_loss > entry.candidate_price
+      );
    }
 
    return false;
 }
 
 //====================================================================
-// VALIDATE TAKE PROFIT DIRECTION
+// VALIDATE TAKE-PROFIT DIRECTION
 //====================================================================
 
 bool PFLS_ValidateTargetDirection(
@@ -292,6 +339,32 @@ bool PFLS_ValidateTargetDirection(
 
    if(signal == PFLS_ENTRY_SELL_CANDIDATE)
       return take_profit < entry_price;
+
+   return false;
+}
+
+//====================================================================
+// VALIDATE TARGET AGAINST PRICE FLOW OBJECTIVE
+//====================================================================
+
+bool PFLS_ValidateObjectiveTarget(
+   const PFLS_EntryResult &entry,
+   const double take_profit)
+{
+   if(entry.objective_upper <= entry.objective_lower)
+      return false;
+
+   if(take_profit < entry.objective_lower ||
+      take_profit > entry.objective_upper)
+      return false;
+
+   // A buy should target a supply objective.
+   if(entry.signal == PFLS_ENTRY_BUY_CANDIDATE)
+      return true;
+
+   // A sell should target a demand objective.
+   if(entry.signal == PFLS_ENTRY_SELL_CANDIDATE)
+      return true;
 
    return false;
 }
@@ -344,6 +417,11 @@ bool PFLS_EstimateMoneyRisk(
 {
    risk_money = 0.0;
 
+   if(volume <= 0.0 ||
+      entry_price <= 0.0 ||
+      stop_loss <= 0.0)
+      return false;
+
    double calculated_profit = 0.0;
 
    if(!OrderCalcProfit(
@@ -353,17 +431,15 @@ bool PFLS_EstimateMoneyRisk(
       entry_price,
       stop_loss,
       calculated_profit))
-   {
       return false;
-   }
 
    risk_money = MathAbs(calculated_profit);
 
-   return (risk_money > 0.0);
+   return risk_money > 0.0;
 }
 
 //====================================================================
-// CALCULATE POSITION VOLUME FROM RISK CAP
+// CALCULATE RISK-BASED VOLUME
 //====================================================================
 
 double PFLS_CalculateRiskBasedVolume(
@@ -396,7 +472,7 @@ double PFLS_CalculateRiskBasedVolume(
       SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
 
    if(minimum_volume <= 0.0 ||
-      maximum_volume <= 0.0 ||
+      maximum_volume < minimum_volume ||
       volume_step <= 0.0)
       return 0.0;
 
@@ -411,31 +487,36 @@ double PFLS_CalculateRiskBasedVolume(
       minimum_risk))
       return 0.0;
 
-   // Never force a minimum lot that exceeds the risk budget.
    if(minimum_risk > risk_budget)
       return 0.0;
 
-   double low = minimum_volume;
-   double high = maximum_volume;
+   int maximum_steps = (int)MathFloor(
+      (maximum_volume - minimum_volume) / volume_step
+      + 0.00000001
+   );
 
-   double best = 0.0;
+   int low = 0;
+   int high = maximum_steps;
+   int best_step = -1;
 
-   for(int i = 0; i < 60; i++)
+   for(int i = 0; i < 64 && low <= high; i++)
    {
-      double middle = (low + high) / 2.0;
+      int middle = low + (high - low) / 2;
 
-      double candidate =
-         PFLS_NormaliseVolume(symbol, middle);
+      double candidate_volume =
+         minimum_volume + middle * volume_step;
 
-      if(candidate <= 0.0)
-         break;
+      candidate_volume = NormalizeDouble(
+         candidate_volume,
+         PFLS_RiskVolumeDigits(volume_step)
+      );
 
       double candidate_risk = 0.0;
 
       if(!PFLS_EstimateMoneyRisk(
          symbol,
          order_type,
-         candidate,
+         candidate_volume,
          entry_price,
          stop_loss,
          candidate_risk))
@@ -443,24 +524,29 @@ double PFLS_CalculateRiskBasedVolume(
 
       if(candidate_risk <= risk_budget)
       {
-         best = candidate;
-
-         low = middle + volume_step / 2.0;
+         best_step = middle;
+         low = middle + 1;
       }
       else
       {
-         high = middle - volume_step / 2.0;
+         high = middle - 1;
       }
-
-      if(high < low)
-         break;
    }
 
-   return PFLS_NormaliseVolume(symbol, best);
+   if(best_step < 0)
+      return 0.0;
+
+   double result =
+      minimum_volume + best_step * volume_step;
+
+   return NormalizeDouble(
+      result,
+      PFLS_RiskVolumeDigits(volume_step)
+   );
 }
 
 //====================================================================
-// COUNT TODAY'S EA TRADES
+// COUNT TODAY'S UNIQUE ENTRY POSITIONS
 //====================================================================
 
 int PFLS_CountDailyTrades(
@@ -476,13 +562,13 @@ int PFLS_CountDailyTrades(
    date_parts.min = 0;
    date_parts.sec = 0;
 
-   datetime day_start =
-      StructToTime(date_parts);
+   datetime day_start = StructToTime(date_parts);
 
    if(!HistorySelect(day_start, now))
       return -1;
 
-   int count = 0;
+   ulong position_ids[2048];
+   int unique_count = 0;
 
    int total = HistoryDealsTotal();
 
@@ -501,18 +587,43 @@ int PFLS_CountDailyTrades(
          ticket, DEAL_MAGIC) != magic_number)
          continue;
 
-      ENUM_DEAL_ENTRY entry =
+      ENUM_DEAL_ENTRY deal_entry =
          (ENUM_DEAL_ENTRY)HistoryDealGetInteger(
             ticket, DEAL_ENTRY);
 
-      if(entry == DEAL_ENTRY_IN ||
-         entry == DEAL_ENTRY_INOUT)
+      if(deal_entry != DEAL_ENTRY_IN &&
+         deal_entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      ulong position_id =
+         (ulong)HistoryDealGetInteger(
+            ticket, DEAL_POSITION_ID);
+
+      if(position_id == 0)
+         continue;
+
+      bool already_counted = false;
+
+      for(int j = 0; j < unique_count; j++)
       {
-         count++;
+         if(position_ids[j] == position_id)
+         {
+            already_counted = true;
+            break;
+         }
       }
+
+      if(already_counted)
+         continue;
+
+      if(unique_count >= 2048)
+         return -1;
+
+      position_ids[unique_count] = position_id;
+      unique_count++;
    }
 
-   return count;
+   return unique_count;
 }
 
 //====================================================================
@@ -546,7 +657,7 @@ int PFLS_CountOpenPositions(
 }
 
 //====================================================================
-// BUILD A VALIDATED TRADE PLAN
+// BUILD VALIDATED RESEARCH TRADE PLAN
 //====================================================================
 
 bool PFLS_BuildTradePlan(
@@ -570,12 +681,67 @@ bool PFLS_BuildTradePlan(
       return false;
    }
 
+   if(entry.timeframe != PERIOD_M5)
+   {
+      plan.rejection_reason = "ENTRY MUST BE M5";
+      return false;
+   }
+
+   if(entry.candidate_price <= 0.0)
+   {
+      plan.rejection_reason = "INVALID ENTRY PRICE";
+      return false;
+   }
+
    if(!PFLS_ValidateTargetDirection(
       entry.signal,
       entry.candidate_price,
       take_profit))
    {
       plan.rejection_reason = "INVALID TARGET DIRECTION";
+      return false;
+   }
+
+   if(!PFLS_ValidateObjectiveTarget(entry, take_profit))
+   {
+      plan.rejection_reason =
+         "TARGET OUTSIDE PRICE FLOW OBJECTIVE";
+      return false;
+   }
+
+   // Enforce the daily research-plan limit.
+   int daily_trades = PFLS_CountDailyTrades(
+      symbol,
+      config.magic_number
+   );
+
+   if(daily_trades < 0)
+   {
+      plan.rejection_reason = "DAILY HISTORY UNAVAILABLE";
+      return false;
+   }
+
+   if(daily_trades >= config.maximum_daily_trades)
+   {
+      plan.rejection_reason = "DAILY TRADE LIMIT REACHED";
+      return false;
+   }
+
+   // One open position per symbol and magic number.
+   int open_positions = PFLS_CountOpenPositions(
+      symbol,
+      config.magic_number
+   );
+
+   if(open_positions < 0)
+   {
+      plan.rejection_reason = "POSITION CHECK FAILED";
+      return false;
+   }
+
+   if(open_positions > 0)
+   {
+      plan.rejection_reason = "POSITION ALREADY OPEN";
       return false;
    }
 
@@ -591,12 +757,12 @@ bool PFLS_BuildTradePlan(
       return false;
    }
 
-   double risk_reward =
-      PFLS_CalculateRiskReward(
-         entry.signal,
-         entry.candidate_price,
-         stop_loss,
-         take_profit);
+   double risk_reward = PFLS_CalculateRiskReward(
+      entry.signal,
+      entry.candidate_price,
+      stop_loss,
+      take_profit
+   );
 
    if(risk_reward < config.minimum_risk_reward)
    {
@@ -618,11 +784,12 @@ bool PFLS_BuildTradePlan(
 
    double volume = PFLS_NormaliseVolume(
       symbol,
-      config.fixed_lot);
+      config.fixed_lot
+   );
 
    if(volume <= 0.0)
    {
-      plan.rejection_reason = "FIXED LOT NOT VALID FOR SYMBOL";
+      plan.rejection_reason = "FIXED LOT INVALID FOR SYMBOL";
       return false;
    }
 
@@ -659,7 +826,6 @@ bool PFLS_BuildTradePlan(
    }
 
    plan.valid = true;
-
    plan.order_type = order_type;
 
    plan.entry_price = entry.candidate_price;
@@ -673,13 +839,12 @@ bool PFLS_BuildTradePlan(
       MathAbs(take_profit - entry.candidate_price);
 
    plan.risk_reward = risk_reward;
-
    plan.volume = volume;
 
    plan.estimated_risk_money = risk_money;
    plan.estimated_risk_percent = risk_percent;
 
-   plan.rejection_reason = "PLAN VALIDATED";
+   plan.rejection_reason = "RESEARCH PLAN VALIDATED";
 
    return true;
 }
