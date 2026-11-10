@@ -1,38 +1,61 @@
 
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
-//| Research Build 1.00                                              |
-//| Multi-Timeframe Price Flow and Zone Research Engine              |
-//| Platform: MetaTrader 5                                           |
-//| Initial target: Deriv Volatility 75 Index                        |
+//| MAIN EXPERT ADVISOR                                              |
+//| Version 2.00.3                                                   |
 //|                                                                  |
-//| IMPORTANT: RESEARCH ONLY. NO AUTOMATED TRADING.                  |
+//| Multi-Timeframe Price Flow and Research Engine                   |
+//| Initial research target: Deriv Volatility 75 Index               |
+//| Platform: MetaTrader 5                                           |
+//|                                                                  |
+//| IMPORTANT: RESEARCH ONLY                                         |
+//| NO AUTOMATED ORDER EXECUTION                                     |
 //+------------------------------------------------------------------+
 #property copyright "PFLS Trader"
-#property version   "1.00"
+#property version   "2.00"
 #property description "PFLS 2.00 - Multi-Timeframe Research EA"
-#property strict
+
+//====================================================================
+// MODULES
+//====================================================================
+
+#include "PFLS_EntryEngine.mqh"
+#include "PFLS_RiskManager.mqh"
+#include "PFLS_Execution.mqh"
 
 //====================================================================
 // INPUTS
 //====================================================================
 
-input int    InpLookbackBars       = 300;
-input int    InpPivotStrength      = 2;
-input int    InpScanInterval       = 30;
-input bool   InpShowChartStatus    = true;
-input bool   InpEnableResearchLog  = true;
+input group "PFLS MARKET SETTINGS"
 
-// Safety lock: this research build cannot execute trades.
-input bool   InpEnableExecution    = false;
+input string InpMarketSymbol = "";
+input int    InpLookbackBars = 300;
+input int    InpPivotStrength = 2;
+input int    InpScanIntervalSeconds = 30;
+
+input group "PFLS ENTRY RESEARCH"
+
+input double InpMinimumWickRatio = 1.5;
+input bool   InpEnableEntryResearch = true;
+
+input group "PFLS DASHBOARD"
+
+input bool InpShowChartStatus = true;
+input bool InpEnableResearchLog = true;
+
+input group "PFLS EXECUTION SAFETY"
+
+input bool InpEnableExecution = false;
+input bool InpEmergencyStop = false;
 
 //====================================================================
 // TIMEFRAME CONFIGURATION
 //====================================================================
 
-#define PFLS_TIMEFRAME_COUNT 8
+#define PFLS_MAIN_TIMEFRAME_COUNT 8
 
-ENUM_TIMEFRAMES PFLS_Timeframes[PFLS_TIMEFRAME_COUNT] =
+ENUM_TIMEFRAMES PFLS_MainTimeframes[PFLS_MAIN_TIMEFRAME_COUNT] =
 {
    PERIOD_W1,
    PERIOD_D1,
@@ -44,418 +67,718 @@ ENUM_TIMEFRAMES PFLS_Timeframes[PFLS_TIMEFRAME_COUNT] =
    PERIOD_M1
 };
 
-//====================================================================
-// ZONE DATA STRUCTURE
-//====================================================================
-
-struct PFLS_Zone
+string PFLS_TimeframeNames[PFLS_MAIN_TIMEFRAME_COUNT] =
 {
-   bool     active;
-   bool     demand;
-   double   upper;
-   double   lower;
-   datetime origin_time;
-   datetime detection_time;
-   int      timeframe_index;
+   "W1", "D1", "H4", "H1",
+   "M30", "M15", "M5", "M1"
 };
 
 //====================================================================
-// GLOBAL DATA
+// GLOBAL STATE
 //====================================================================
 
-PFLS_Zone DemandZones[PFLS_TIMEFRAME_COUNT];
-PFLS_Zone SupplyZones[PFLS_TIMEFRAME_COUNT];
+PFLS_PriceFlowState    PFLS_Flow;
+PFLS_RiskConfig        PFLS_Risk;
+PFLS_TradePlan         PFLS_CurrentTradePlan;
+PFLS_EntryResult       PFLS_CurrentEntry;
+PFLS_ExecutionStatus   PFLS_Execution;
 
-datetime LastScanTime = 0;
+datetime PFLS_LastScanTime = 0;
+datetime PFLS_LastM5SignalTime = 0;
 
-int TotalDemandZones = 0;
-int TotalSupplyZones = 0;
+double PFLS_PreviousTickPrice = 0.0;
+double PFLS_CurrentTickPrice  = 0.0;
 
-string PFLS_Status = "INITIALISING";
+bool PFLS_Initialised = false;
+bool PFLS_DataAvailable = false;
+
+string PFLS_StatusMessage = "INITIALISING";
 
 //====================================================================
-// RESET ZONE
+// MITIGATED ZONE MEMORY
 //====================================================================
 
-void ResetZone(PFLS_Zone &zone)
+// Prevent a zone touched during this running session from being
+// displayed again after a later timeframe rescan.
+//
+// The zone module separately maintains its own interaction history.
+// This additional list protects the active dashboard snapshots.
+
+#define PFLS_MAX_MITIGATED_ZONES 512
+
+datetime PFLS_MitigatedOrigin[PFLS_MAX_MITIGATED_ZONES];
+ENUM_TIMEFRAMES PFLS_MitigatedTimeframe[PFLS_MAX_MITIGATED_ZONES];
+bool PFLS_MitigatedDemand[PFLS_MAX_MITIGATED_ZONES];
+
+int PFLS_MitigatedCount = 0;
+
+//====================================================================
+// LOGGING
+//====================================================================
+
+void PFLS_Log(string message)
 {
-   zone.active = false;
-   zone.demand = false;
-   zone.upper = 0.0;
-   zone.lower = 0.0;
-   zone.origin_time = 0;
-   zone.detection_time = 0;
-   zone.timeframe_index = -1;
+   if(!InpEnableResearchLog)
+      return;
+
+   Print("[PFLS 2.00] ", message);
 }
 
 //====================================================================
-// PIVOT HIGH
+// SYMBOL
 //====================================================================
 
-bool IsPivotHigh(MqlRates &rates[], int index, int strength,
-                 int total)
+string PFLS_GetMarketSymbol()
 {
-   if(index - strength < 1)
-      return false;
+   if(StringLen(InpMarketSymbol) > 0)
+      return InpMarketSymbol;
 
-   if(index + strength >= total)
-      return false;
+   return _Symbol;
+}
 
-   double pivot = rates[index].high;
+//====================================================================
+// TIMEFRAME INDEX
+//====================================================================
 
-   for(int i = 1; i <= strength; i++)
+int PFLS_GetTimeframeIndex(ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < PFLS_MAIN_TIMEFRAME_COUNT; i++)
    {
-      if(rates[index-i].high >= pivot)
-         return false;
-
-      if(rates[index+i].high > pivot)
-         return false;
+      if(PFLS_MainTimeframes[i] == timeframe)
+         return i;
    }
 
-   return true;
+   return -1;
 }
 
 //====================================================================
-// PIVOT LOW
+// MITIGATED ZONE REGISTRATION
 //====================================================================
 
-bool IsPivotLow(MqlRates &rates[], int index, int strength,
-                int total)
+bool PFLS_IsZonePreviouslyMitigated(
+   const PFLS_ZoneRecord &zone
+)
 {
-   if(index - strength < 1)
-      return false;
-
-   if(index + strength >= total)
-      return false;
-
-   double pivot = rates[index].low;
-
-   for(int i = 1; i <= strength; i++)
+   for(int i = 0; i < PFLS_MitigatedCount; i++)
    {
-      if(rates[index-i].low <= pivot)
-         return false;
-
-      if(rates[index+i].low < pivot)
-         return false;
-   }
-
-   return true;
-}
-
-//====================================================================
-// CHECK WHETHER A CANDLE ENTERED A ZONE
-//====================================================================
-
-bool CandleIntersectsZone(MqlRates &candle[],
-                          double upper,
-                          double lower)
-{
-   if(candle[0].high >= lower &&
-      candle[0].low <= upper)
-   {
-      return true;
-   }
-
-   return false;
-}
-
-//====================================================================
-// BUILD A PROVISIONAL ZONE
-//====================================================================
-
-bool BuildZone(MqlRates &rates[],
-               int total,
-               int timeframe_index,
-               bool demand,
-               PFLS_Zone &result)
-{
-   ResetZone(result);
-
-   int strength = InpPivotStrength;
-
-   if(total < strength * 2 + 20)
-      return false;
-
-   int maximum_index = total - strength - 1;
-
-   if(maximum_index > InpLookbackBars - strength - 2)
-      maximum_index = InpLookbackBars - strength - 2;
-
-   // Search for the nearest confirmed pivot broken by
-   // the most recently completed candle.
-
-   for(int i = strength + 2; i <= maximum_index; i++)
-   {
-      bool structure_break = false;
-
-      if(demand)
+      if(PFLS_MitigatedOrigin[i] == zone.origin_time &&
+         PFLS_MitigatedTimeframe[i] == zone.timeframe &&
+         PFLS_MitigatedDemand[i] == zone.is_demand)
       {
-         if(IsPivotHigh(rates, i, strength, total) &&
-            rates[1].close > rates[i].high)
-         {
-            structure_break = true;
-         }
+         return true;
       }
-      else
-      {
-         if(IsPivotLow(rates, i, strength, total) &&
-            rates[1].close < rates[i].low)
-         {
-            structure_break = true;
-         }
-      }
-
-      if(!structure_break)
-         continue;
-
-      // Find the last opposing candle before the break.
-      int origin_index = -1;
-
-      for(int j = i - 1; j >= 2; j--)
-      {
-         if(demand && rates[j].close < rates[j].open)
-         {
-            origin_index = j;
-            break;
-         }
-
-         if(!demand && rates[j].close > rates[j].open)
-         {
-            origin_index = j;
-            break;
-         }
-      }
-
-      if(origin_index < 0)
-         continue;
-
-      double zone_upper = 0.0;
-      double zone_lower = 0.0;
-
-      if(demand)
-      {
-         // Demand: highest body boundary to lowest wick.
-         zone_upper = MathMax(rates[origin_index].open,
-                              rates[origin_index].close);
-
-         zone_lower = rates[origin_index].low;
-      }
-      else
-      {
-         // Supply: highest wick to lowest body boundary.
-         zone_upper = rates[origin_index].high;
-
-         zone_lower = MathMin(rates[origin_index].open,
-                              rates[origin_index].close);
-      }
-
-      if(zone_upper <= zone_lower)
-         continue;
-
-      // First subsequent price entry means the zone
-      // is no longer fresh and must not be active.
-      bool touched = false;
-
-      for(int k = origin_index - 1; k >= 1; k--)
-      {
-         if(rates[k].high >= zone_lower &&
-            rates[k].low <= zone_upper)
-         {
-            touched = true;
-            break;
-         }
-      }
-
-      if(touched)
-         continue;
-
-      result.active = true;
-      result.demand = demand;
-      result.upper = zone_upper;
-      result.lower = zone_lower;
-      result.origin_time = rates[origin_index].time;
-      result.detection_time = TimeCurrent();
-      result.timeframe_index = timeframe_index;
-
-      return true;
    }
 
    return false;
 }
 
-//====================================================================
-// SCAN ONE TIMEFRAME
-//====================================================================
+//--------------------------------------------------------------------
 
-void ScanTimeframe(int index)
+void PFLS_RegisterMitigatedZone(
+   const PFLS_ZoneRecord &zone
+)
 {
-   MqlRates rates[];
+   if(zone.origin_time <= 0)
+      return;
 
-   ArraySetAsSeries(rates, true);
+   if(PFLS_IsZonePreviouslyMitigated(zone))
+      return;
 
-   int copied = CopyRates(_Symbol,
-                          PFLS_Timeframes[index],
-                          0,
-                          InpLookbackBars,
-                          rates);
+   if(PFLS_MitigatedCount >= PFLS_MAX_MITIGATED_ZONES)
+      return;
 
-   if(copied < 50)
+   PFLS_MitigatedOrigin[PFLS_MitigatedCount] =
+      zone.origin_time;
+
+   PFLS_MitigatedTimeframe[PFLS_MitigatedCount] =
+      zone.timeframe;
+
+   PFLS_MitigatedDemand[PFLS_MitigatedCount] =
+      zone.is_demand;
+
+   PFLS_MitigatedCount++;
+
+   PFLS_Log(
+      "ZONE MITIGATED | " +
+      EnumToString(zone.timeframe) +
+      " | " +
+      (zone.is_demand ? "DEMAND" : "SUPPLY")
+   );
+}
+
+//--------------------------------------------------------------------
+
+void PFLS_FilterMitigatedZone(
+   PFLS_ZoneRecord &zone
+)
+{
+   if(!zone.active)
+      return;
+
+   if(PFLS_IsZonePreviouslyMitigated(zone))
    {
-      ResetZone(DemandZones[index]);
-      ResetZone(SupplyZones[index]);
+      zone.active = false;
+      zone.state = PFLS_ZONE_STATE_TOUCHED;
+   }
+}
 
-      if(InpEnableResearchLog)
+//====================================================================
+// APPLY ZONE FILTERS
+//====================================================================
+
+void PFLS_FilterAllMitigatedZones()
+{
+   for(int i = 0; i < PFLS_MAIN_TIMEFRAME_COUNT; i++)
+   {
+      PFLS_FilterMitigatedZone(
+         PFLS_Flow.ladder[i].demand
+      );
+
+      PFLS_FilterMitigatedZone(
+         PFLS_Flow.ladder[i].supply
+      );
+   }
+}
+
+//====================================================================
+// LIVE ZONE INTERACTION
+//====================================================================
+
+void PFLS_UpdateLiveZoneInteractions(
+   const double previous_price,
+   const double current_price,
+   const datetime event_time
+)
+{
+   if(previous_price <= 0 || current_price <= 0)
+      return;
+
+   for(int i = 0; i < PFLS_MAIN_TIMEFRAME_COUNT; i++)
+   {
+      // DEMAND
+      if(PFLS_Flow.ladder[i].demand.active)
       {
-         Print("PFLS | Insufficient history | ",
-               EnumToString(PFLS_Timeframes[index]),
-               " | Bars: ", copied);
+         PFLS_UpdateZoneInteractionPath(
+            PFLS_Flow.ladder[i].demand,
+            previous_price,
+            current_price,
+            event_time
+         );
+
+         if(PFLS_Flow.ladder[i].demand.first_touch_time > 0)
+         {
+            PFLS_RegisterMitigatedZone(
+               PFLS_Flow.ladder[i].demand
+            );
+         }
       }
+
+      // SUPPLY
+      if(PFLS_Flow.ladder[i].supply.active)
+      {
+         PFLS_UpdateZoneInteractionPath(
+            PFLS_Flow.ladder[i].supply,
+            previous_price,
+            current_price,
+            event_time
+         );
+
+         if(PFLS_Flow.ladder[i].supply.first_touch_time > 0)
+         {
+            PFLS_RegisterMitigatedZone(
+               PFLS_Flow.ladder[i].supply
+            );
+         }
+      }
+   }
+
+   PFLS_FilterAllMitigatedZones();
+}
+
+//====================================================================
+// OBJECTIVE INTERACTION
+//====================================================================
+
+void PFLS_UpdateLiveObjective(
+   const double previous_price,
+   const double current_price,
+   const datetime event_time
+)
+{
+   if(!PFLS_Flow.objective.valid)
+      return;
+
+   if(previous_price <= 0 || current_price <= 0)
+      return;
+
+   PFLS_UpdateObjectiveInteractionPath(
+      PFLS_Flow.objective,
+      previous_price,
+      current_price,
+      PFLS_Flow.d1_bias,
+      event_time
+   );
+}
+
+//====================================================================
+// PRICE FLOW SCAN
+//====================================================================
+
+bool PFLS_RunPriceFlowScan()
+{
+   string symbol = PFLS_GetMarketSymbol();
+
+   if(!SymbolSelect(symbol, true))
+   {
+      PFLS_StatusMessage = "MARKET SYMBOL NOT AVAILABLE";
+      PFLS_DataAvailable = false;
+      return false;
+   }
+
+   bool result = PFLS_UpdatePriceFlow(
+      symbol,
+      InpLookbackBars,
+      InpPivotStrength,
+      PFLS_Flow
+   );
+
+   if(!result)
+   {
+      PFLS_StatusMessage = "WAITING FOR MULTI-TIMEFRAME DATA";
+      PFLS_DataAvailable = false;
+      return false;
+   }
+
+   // Remove zones already touched during this session.
+   PFLS_FilterAllMitigatedZones();
+
+   PFLS_LastScanTime = TimeCurrent();
+
+   PFLS_DataAvailable = true;
+
+   PFLS_StatusMessage = "MULTI-TIMEFRAME RESEARCH ACTIVE";
+
+   PFLS_Log("PRICE FLOW SCAN COMPLETED");
+
+   return true;
+}
+
+//====================================================================
+// M5 ENTRY RESEARCH
+//====================================================================
+
+void PFLS_RunEntryResearch()
+{
+   if(!InpEnableEntryResearch)
+   {
+      PFLS_ResetEntryResult(PFLS_CurrentEntry);
+      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+      return;
+   }
+
+   if(!PFLS_DataAvailable)
+      return;
+
+   // Entry hypotheses require directional permission.
+   if(!PFLS_Flow.directional_objective_allowed)
+   {
+      PFLS_ResetEntryResult(PFLS_CurrentEntry);
+      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
 
       return;
    }
 
-   BuildZone(rates, copied, index, true, DemandZones[index]);
+   // An observation-only objective is not an entry target.
+   if(!PFLS_Flow.objective.valid ||
+      PFLS_Flow.objective.status == PFLS_OBJECTIVE_OBSERVATION_ONLY ||
+      PFLS_Flow.objective.status == PFLS_OBJECTIVE_INVALIDATED ||
+      PFLS_Flow.objective.status == PFLS_OBJECTIVE_RESOLVED)
+   {
+      PFLS_ResetEntryResult(PFLS_CurrentEntry);
+      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
 
-   BuildZone(rates, copied, index, false, SupplyZones[index]);
+      return;
+   }
+
+   MqlRates m5_rates[];
+
+   ArraySetAsSeries(m5_rates, true);
+
+   int copied = CopyRates(
+      PFLS_GetMarketSymbol(),
+      PERIOD_M5,
+      0,
+      InpLookbackBars,
+      m5_rates
+   );
+
+   if(copied < 20)
+      return;
+
+   PFLS_EntryResult candidate;
+
+   ZeroMemory(candidate);
+
+   bool evaluated = PFLS_EvaluateEntry(
+      m5_rates,
+      copied,
+      PERIOD_M5,
+      PFLS_Flow.ladder[6].demand,
+      PFLS_Flow.ladder[6].supply,
+      PFLS_Flow.ladder[6].structure,
+      PFLS_Flow,
+      InpMinimumWickRatio,
+      candidate
+   );
+
+   if(!evaluated || !candidate.valid)
+   {
+      PFLS_ResetEntryResult(PFLS_CurrentEntry);
+      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+      return;
+   }
+
+   // Avoid repeatedly recording the same completed M5 signal.
+   if(candidate.confirmation_time <= PFLS_LastM5SignalTime)
+      return;
+
+   PFLS_LastM5SignalTime = candidate.confirmation_time;
+
+   PFLS_CurrentEntry = candidate;
+
+   PFLS_Log(
+      "NEW M5 ENTRY HYPOTHESIS | " +
+      candidate.explanation
+   );
+
+   // Determine the target from the selected objective.
+   double objective_target = 0.0;
+
+   if(candidate.signal == PFLS_ENTRY_BUY_CANDIDATE &&
+      candidate.objective_is_supply)
+   {
+      objective_target = candidate.objective_lower;
+   }
+   else if(candidate.signal == PFLS_ENTRY_SELL_CANDIDATE &&
+           !candidate.objective_is_supply)
+   {
+      objective_target = candidate.objective_upper;
+   }
+
+   if(objective_target <= 0)
+   {
+      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+      PFLS_Log("TRADE PLAN NOT BUILT: INVALID OBJECTIVE TARGET");
+      return;
+   }
+
+   PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+
+   bool plan_created = PFLS_BuildTradePlan(
+      PFLS_GetMarketSymbol(),
+      PFLS_CurrentEntry,
+      PFLS_Risk,
+      objective_target,
+      PFLS_CurrentTradePlan
+   );
+
+   if(!plan_created || !PFLS_CurrentTradePlan.valid)
+   {
+      PFLS_Log(
+         "TRADE PLAN REJECTED | " +
+         PFLS_CurrentTradePlan.rejection_reason
+      );
+
+      return;
+   }
+
+   PFLS_Log(
+      "RESEARCH TRADE PLAN CREATED | RR: " +
+      DoubleToString(PFLS_CurrentTradePlan.risk_reward, 2)
+   );
 }
 
 //====================================================================
-// SCAN ALL TIMEFRAMES
+// EXECUTION SAFETY INSPECTION
 //====================================================================
 
-void ScanAllTimeframes()
+void PFLS_UpdateExecutionSafety()
 {
-   TotalDemandZones = 0;
-   TotalSupplyZones = 0;
+   PFLS_CheckExecutionSafety(
+      PFLS_GetMarketSymbol(),
+      InpEnableExecution,
+      InpEmergencyStop,
+      PFLS_Execution
+   );
 
-   for(int i = 0; i < PFLS_TIMEFRAME_COUNT; i++)
+   // Independent permanent execution lock.
+   // This research build never sends orders.
+
+   if(PFLS_IsOrderExecutionAllowed(PFLS_Execution))
    {
-      ScanTimeframe(i);
-
-      if(DemandZones[i].active)
-         TotalDemandZones++;
-
-      if(SupplyZones[i].active)
-         TotalSupplyZones++;
-   }
-
-   LastScanTime = TimeCurrent();
-
-   PFLS_Status = "RESEARCH SCAN COMPLETE";
-
-   if(InpEnableResearchLog)
-   {
-      Print("================================================");
-      Print("PFLS TRADER 2.00 | RESEARCH SCAN");
-      Print("Symbol: ", _Symbol);
-      Print("Demand zones: ", TotalDemandZones);
-      Print("Supply zones: ", TotalSupplyZones);
-      Print("Timeframes scanned: ", PFLS_TIMEFRAME_COUNT);
-      Print("Execution: DISABLED");
-      Print("================================================");
-
-      for(int i = 0; i < PFLS_TIMEFRAME_COUNT; i++)
-      {
-         string tf = EnumToString(PFLS_Timeframes[i]);
-
-         if(DemandZones[i].active)
-         {
-            Print("FRESH DEMAND | ", tf,
-                  " | Lower: ", DoubleToString(DemandZones[i].lower, _Digits),
-                  " | Upper: ", DoubleToString(DemandZones[i].upper, _Digits));
-         }
-
-         if(SupplyZones[i].active)
-         {
-            Print("FRESH SUPPLY | ", tf,
-                  " | Lower: ", DoubleToString(SupplyZones[i].lower, _Digits),
-                  " | Upper: ", DoubleToString(SupplyZones[i].upper, _Digits));
-         }
-      }
+      PFLS_Log("UNEXPECTED EXECUTION AUTHORIZATION STATE");
    }
 }
 
 //====================================================================
-// PRICE FLOW OBSERVATION
+// DASHBOARD HELPERS
 //====================================================================
 
-string GetPriceLocation()
+string PFLS_ZoneText(const PFLS_ZoneRecord &zone)
 {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(!zone.active)
+      return "NO ACTIVE FRESH ZONE";
 
-   if(bid <= 0.0)
-      return "PRICE UNAVAILABLE";
+   return
+      DoubleToString(zone.lower, _Digits) +
+      " - " +
+      DoubleToString(zone.upper, _Digits);
+}
 
-   bool inside_demand = false;
-   bool inside_supply = false;
+//--------------------------------------------------------------------
 
-   for(int i = 0; i < PFLS_TIMEFRAME_COUNT; i++)
-   {
-      if(DemandZones[i].active &&
-         bid >= DemandZones[i].lower &&
-         bid <= DemandZones[i].upper)
-      {
-         inside_demand = true;
-      }
+string PFLS_ObjectiveText()
+{
+   if(!PFLS_Flow.objective.valid)
+      return "NO VALID OBJECTIVE";
 
-      if(SupplyZones[i].active &&
-         bid >= SupplyZones[i].lower &&
-         bid <= SupplyZones[i].upper)
-      {
-         inside_supply = true;
-      }
-   }
+   string direction =
+      PFLS_Flow.objective.is_supply ?
+      "SUPPLY ABOVE" :
+      "DEMAND BELOW";
 
-   if(inside_demand && inside_supply)
-      return "OVERLAPPING ZONE AREAS";
+   return
+      direction +
+      " | " +
+      EnumToString(PFLS_Flow.objective.source_timeframe) +
+      " | " +
+      DoubleToString(PFLS_Flow.objective.lower, _Digits) +
+      " - " +
+      DoubleToString(PFLS_Flow.objective.upper, _Digits);
+}
 
-   if(inside_demand)
-      return "INSIDE FRESH DEMAND AREA";
+//--------------------------------------------------------------------
 
-   if(inside_supply)
-      return "INSIDE FRESH SUPPLY AREA";
+string PFLS_EntryText()
+{
+   if(!PFLS_CurrentEntry.valid)
+      return "NO CONFIRMED ENTRY HYPOTHESIS";
 
-   return "BETWEEN ACTIVE ZONES";
+   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_BUY_CANDIDATE)
+      return "BUY CANDIDATE";
+
+   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_SELL_CANDIDATE)
+      return "SELL CANDIDATE";
+
+   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_AMBIGUOUS)
+      return "AMBIGUOUS SIGNAL";
+
+   return "NO ENTRY";
 }
 
 //====================================================================
 // DASHBOARD
 //====================================================================
 
-void UpdateDashboard()
+void PFLS_UpdateDashboard()
 {
    if(!InpShowChartStatus)
       return;
 
-   string display =
-      "PFLS TRADER 2.00\n"
-      "RESEARCH BUILD 1.00\n"
-      "--------------------------\n";
+   string symbol = PFLS_GetMarketSymbol();
 
-   display += "Symbol: " + _Symbol + "\n";
-   display += "Status: " + PFLS_Status + "\n";
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-   display += "Timeframes: W1 D1 H4 H1\n";
-   display += "             M30 M15 M5 M1\n";
+   string dashboard = "";
 
-   display += "Fresh demand: " +
-              IntegerToString(TotalDemandZones) + "\n";
+   dashboard += "====================================\n";
+   dashboard += "          PFLS TRADER 2.00\n";
+   dashboard += "       MULTI-TIMEFRAME RESEARCH\n";
+   dashboard += "====================================\n";
 
-   display += "Fresh supply: " +
-              IntegerToString(TotalSupplyZones) + "\n";
+   dashboard += "SYMBOL: " + symbol + "\n";
 
-   display += "Price location: " + GetPriceLocation() + "\n";
+   dashboard +=
+      "PRICE: " +
+      DoubleToString(bid, _Digits) +
+      "\n";
 
-   display += "Last scan: " +
-              TimeToString(LastScanTime,
-                           TIME_DATE | TIME_MINUTES | TIME_SECONDS) + "\n";
+   dashboard +=
+      "DATA: " +
+      (PFLS_DataAvailable ? "CONNECTED" : "WAITING") +
+      "\n";
 
-   display += "--------------------------\n";
-   display += "EXECUTION: LOCKED OFF\n";
-   display += "ENTRY ENGINE: NOT ENABLED\n";
-   display += "RESEARCH MODE ONLY";
+   dashboard +=
+      "STATUS: " +
+      PFLS_StatusMessage +
+      "\n\n";
 
-   Comment(display);
+   dashboard += "---------- PRICE FLOW ----------\n";
+
+   dashboard +=
+      "W1 CONTEXT: " +
+      PFLS_DirectionText(PFLS_Flow.w1_context) +
+      "\n";
+
+   dashboard +=
+      "D1 BIAS: " +
+      PFLS_DirectionText(PFLS_Flow.d1_bias) +
+      "\n";
+
+   dashboard +=
+      "D1 EVIDENCE: " +
+      PFLS_D1EvidenceText(PFLS_Flow.d1_evidence) +
+      "\n";
+
+   dashboard +=
+      "DIRECTIONAL PERMISSION: " +
+      (PFLS_Flow.directional_objective_allowed ?
+       "YES" : "SUSPENDED") +
+      "\n";
+
+   dashboard +=
+      "OBJECTIVE: " +
+      PFLS_ObjectiveText() +
+      "\n";
+
+   dashboard +=
+      "OBJECTIVE STATUS: " +
+      PFLS_ObjectiveStatusText(PFLS_Flow.objective.status) +
+      "\n\n";
+
+   dashboard += "---------- ACTIVE ZONES ----------\n";
+
+   dashboard +=
+      "D1 DEMAND: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[1].demand) +
+      "\n";
+
+   dashboard +=
+      "D1 SUPPLY: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[1].supply) +
+      "\n";
+
+   dashboard +=
+      "H4 DEMAND: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[2].demand) +
+      "\n";
+
+   dashboard +=
+      "H4 SUPPLY: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[2].supply) +
+      "\n";
+
+   dashboard +=
+      "M5 DEMAND: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[6].demand) +
+      "\n";
+
+   dashboard +=
+      "M5 SUPPLY: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[6].supply) +
+      "\n\n";
+
+   dashboard += "---------- ENTRY RESEARCH ----------\n";
+
+   dashboard +=
+      "M5 ENTRY: " +
+      PFLS_EntryText() +
+      "\n";
+
+   dashboard +=
+      "ENTRY DETAIL: " +
+      (PFLS_CurrentEntry.valid ?
+       PFLS_CurrentEntry.explanation :
+       "WAITING FOR VALID SETUP") +
+      "\n";
+
+   dashboard +=
+      "TRADE PLAN: " +
+      (PFLS_CurrentTradePlan.valid ?
+       "VALID RESEARCH PLAN" :
+       "NOT VALIDATED") +
+      "\n";
+
+   if(PFLS_CurrentTradePlan.valid)
+   {
+      dashboard +=
+         "ENTRY: " +
+         DoubleToString(PFLS_CurrentTradePlan.entry_price, _Digits) +
+         "\n";
+
+      dashboard +=
+         "STOP: " +
+         DoubleToString(PFLS_CurrentTradePlan.stop_loss, _Digits) +
+         "\n";
+
+      dashboard +=
+         "TARGET: " +
+         DoubleToString(PFLS_CurrentTradePlan.take_profit, _Digits) +
+         "\n";
+
+      dashboard +=
+         "RISK/REWARD: 1:" +
+         DoubleToString(PFLS_CurrentTradePlan.risk_reward, 2) +
+         "\n";
+   }
+
+   dashboard += "\n---------- EXECUTION SAFETY ----------\n";
+
+   dashboard +=
+      "EXECUTION STATE: " +
+      PFLS_ExecutionStateText(PFLS_Execution.state) +
+      "\n";
+
+   dashboard +=
+      "DEMO ACCOUNT: " +
+      (PFLS_Execution.account_is_demo ? "YES" : "NO") +
+      "\n";
+
+   dashboard +=
+      "SAFETY CHECKS: " +
+      (PFLS_Execution.safety_checks_passed ? "PASSED" : "NOT PASSED") +
+      "\n";
+
+   dashboard += "ORDER EXECUTION: PERMANENTLY DISABLED\n";
+
+   dashboard += "\n---------- DEVELOPMENT ----------\n";
+
+   dashboard +=
+      "ZONE MODULE: " +
+      PFLS_GetZoneModuleVersion() +
+      "\n";
+
+   dashboard +=
+      "STRUCTURE MODULE: " +
+      PFLS_GetStructureModuleVersion() +
+      "\n";
+
+   dashboard +=
+      "PRICE FLOW: " +
+      PFLS_GetPriceFlowVersion() +
+      "\n";
+
+   dashboard +=
+      "ENTRY ENGINE: " +
+      PFLS_GetEntryModuleVersion() +
+      "\n";
+
+   dashboard +=
+      "RISK MANAGER: " +
+      PFLS_GetRiskModuleVersion() +
+      "\n";
+
+   dashboard +=
+      "EXECUTION MODULE: " +
+      PFLS_GetExecutionModuleVersion() +
+      "\n";
+
+   dashboard += "WIN-RATE GOAL: 70% - RESEARCH TARGET ONLY\n";
+   dashboard += "NO VERIFIED WIN RATE YET\n";
+
+   dashboard += "====================================";
+
+   Comment(dashboard);
 }
 
 //====================================================================
@@ -464,36 +787,63 @@ void UpdateDashboard()
 
 int OnInit()
 {
-   for(int i = 0; i < PFLS_TIMEFRAME_COUNT; i++)
+   string symbol = PFLS_GetMarketSymbol();
+
+   if(!SymbolSelect(symbol, true))
    {
-      ResetZone(DemandZones[i]);
-      ResetZone(SupplyZones[i]);
+      Print("PFLS INITIALISATION FAILED: SYMBOL NOT AVAILABLE");
+      return INIT_FAILED;
    }
 
    if(InpLookbackBars < 50 ||
       InpPivotStrength < 1 ||
-      InpScanInterval < 1)
+      InpScanIntervalSeconds < 1)
    {
-      Print("PFLS ERROR: Invalid input settings.");
+      Print("PFLS INITIALISATION FAILED: INVALID INPUT SETTINGS");
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   // This build deliberately refuses execution mode.
-   if(InpEnableExecution)
-   {
-      Print("PFLS SAFETY LOCK: Execution is not available ",
-            "in Research Build 1.00.");
-   }
+   // Initialise zone history.
+   PFLS_InitialiseZoneHistory();
 
-   EventSetTimer(InpScanInterval);
+   // Initialise price-flow state.
+   PFLS_InitialisePriceFlow(PFLS_Flow);
 
-   Print("PFLS TRADER 2.00 INITIALISED");
-   Print("Research mode active.");
-   Print("Symbol: ", _Symbol);
-   Print("Automated trading is not implemented.");
+   // Initialise risk configuration.
+   PFLS_ResetRiskConfig(PFLS_Risk);
 
-   ScanAllTimeframes();
-   UpdateDashboard();
+   // Execution remains disabled regardless of user inputs.
+   PFLS_Risk.execution_enabled = false;
+   PFLS_Risk.emergency_stop = InpEmergencyStop;
+
+   PFLS_ValidateRiskConfig(PFLS_Risk);
+
+   PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+
+   PFLS_ResetExecutionStatus(PFLS_Execution);
+
+   ZeroMemory(PFLS_CurrentEntry);
+
+   PFLS_MitigatedCount = 0;
+
+   PFLS_PreviousTickPrice = 0.0;
+   PFLS_CurrentTickPrice = 0.0;
+
+   PFLS_Initialised = true;
+
+   // First research scan.
+   PFLS_RunPriceFlowScan();
+
+   // Execution inspection.
+   PFLS_UpdateExecutionSafety();
+
+   // Timer-based research updates.
+   EventSetTimer(InpScanIntervalSeconds);
+
+   PFLS_UpdateDashboard();
+
+   PFLS_Log("PFLS TRADER 2.00 INITIALISED");
+   PFLS_Log("RESEARCH MODE - ORDER EXECUTION DISABLED");
 
    return INIT_SUCCEEDED;
 }
@@ -504,8 +854,16 @@ int OnInit()
 
 void OnTimer()
 {
-   ScanAllTimeframes();
-   UpdateDashboard();
+   if(!PFLS_Initialised)
+      return;
+
+   PFLS_RunPriceFlowScan();
+
+   PFLS_RunEntryResearch();
+
+   PFLS_UpdateExecutionSafety();
+
+   PFLS_UpdateDashboard();
 }
 
 //====================================================================
@@ -514,22 +872,59 @@ void OnTimer()
 
 void OnTick()
 {
-   // No trading commands are present in this research build.
-   // Tick data is used only to refresh the displayed observation.
+   if(!PFLS_Initialised)
+      return;
 
-   UpdateDashboard();
+   string symbol = PFLS_GetMarketSymbol();
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(symbol, tick))
+      return;
+
+   PFLS_PreviousTickPrice = PFLS_CurrentTickPrice;
+
+   PFLS_CurrentTickPrice = tick.bid;
+
+   if(PFLS_PreviousTickPrice > 0 &&
+      PFLS_CurrentTickPrice > 0)
+   {
+      datetime event_time = TimeCurrent();
+
+      // Track zone first-touch events on incoming ticks.
+      PFLS_UpdateLiveZoneInteractions(
+         PFLS_PreviousTickPrice,
+         PFLS_CurrentTickPrice,
+         event_time
+      );
+
+      // Track objective interaction independently.
+      PFLS_UpdateLiveObjective(
+         PFLS_PreviousTickPrice,
+         PFLS_CurrentTickPrice,
+         event_time
+      );
+   }
+
+   PFLS_UpdateDashboard();
 }
 
 //====================================================================
-// SHUTDOWN
+// DEINITIALISATION
 //====================================================================
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+
    Comment("");
 
-   Print("PFLS TRADER 2.00 STOPPED.");
-}
-//+------------------------------------------------------------------+
+   PFLS_Initialised = false;
 
+   PFLS_Log(
+      "PFLS TRADER STOPPED | REASON: " +
+      IntegerToString(reason)
+   );
+}
+
+//+------------------------------------------------------------------+
