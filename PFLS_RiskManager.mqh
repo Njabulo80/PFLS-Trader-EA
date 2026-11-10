@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| RISK MANAGEMENT MODULE                                           |
-//| Version 2.00.2                                                   |
+//| Version 2.00.3                                                   |
 //|                                                                  |
 //| Risk calculations and validation only.                           |
 //| No order placement.                                              |
@@ -13,7 +13,7 @@
 
 #include "PFLS_EntryEngine.mqh"
 
-#define PFLS_RISK_MODULE_VERSION "2.00.2"
+#define PFLS_RISK_MODULE_VERSION "2.00.3"
 
 //====================================================================
 // DEFAULT RISK SETTINGS
@@ -154,7 +154,7 @@ bool PFLS_ValidateRiskConfig(
 bool PFLS_RiskExecutionAllowed(
    const PFLS_RiskConfig &config)
 {
-   // Research build: execution is permanently denied here.
+   // Research build: execution is permanently denied.
    return false;
 }
 
@@ -180,7 +180,6 @@ double PFLS_RiskNormalisePrice(
       return 0.0;
 
    double steps = price / tick_size;
-
    double rounded_steps;
 
    if(round_up)
@@ -202,8 +201,9 @@ int PFLS_RiskVolumeDigits(const double step)
 {
    for(int digits = 0; digits <= 8; digits++)
    {
-      if(MathAbs(step * MathPow(10.0, digits) -
-                 MathRound(step * MathPow(10.0, digits))) < 0.00000001)
+      double scaled = step * MathPow(10.0, digits);
+
+      if(MathAbs(scaled - MathRound(scaled)) < 0.00000001)
          return digits;
    }
 
@@ -345,26 +345,60 @@ bool PFLS_ValidateTargetDirection(
 
 //====================================================================
 // VALIDATE TARGET AGAINST PRICE FLOW OBJECTIVE
+// VERSION 2.00.3
 //====================================================================
 
 bool PFLS_ValidateObjectiveTarget(
    const PFLS_EntryResult &entry,
    const double take_profit)
 {
+   if(!entry.valid)
+      return false;
+
+   if(entry.candidate_price <= 0.0 ||
+      take_profit <= 0.0)
+      return false;
+
    if(entry.objective_upper <= entry.objective_lower)
       return false;
 
+   if(entry.objective_timeframe == PERIOD_CURRENT)
+      return false;
+
+   // Take-profit must be inside the objective zone.
    if(take_profit < entry.objective_lower ||
       take_profit > entry.objective_upper)
       return false;
 
-   // A buy should target a supply objective.
+   // BUY must target supply entirely above entry.
    if(entry.signal == PFLS_ENTRY_BUY_CANDIDATE)
-      return true;
+   {
+      if(!entry.objective_is_supply)
+         return false;
 
-   // A sell should target a demand objective.
-   if(entry.signal == PFLS_ENTRY_SELL_CANDIDATE)
+      if(entry.objective_lower <= entry.candidate_price)
+         return false;
+
+      if(take_profit <= entry.candidate_price)
+         return false;
+
       return true;
+   }
+
+   // SELL must target demand entirely below entry.
+   if(entry.signal == PFLS_ENTRY_SELL_CANDIDATE)
+   {
+      if(entry.objective_is_supply)
+         return false;
+
+      if(entry.objective_upper >= entry.candidate_price)
+         return false;
+
+      if(take_profit >= entry.candidate_price)
+         return false;
+
+      return true;
+   }
 
    return false;
 }
@@ -705,7 +739,7 @@ bool PFLS_BuildTradePlan(
    if(!PFLS_ValidateObjectiveTarget(entry, take_profit))
    {
       plan.rejection_reason =
-         "TARGET OUTSIDE PRICE FLOW OBJECTIVE";
+         "OBJECTIVE TYPE, DIRECTION OR TARGET INVALID";
       return false;
    }
 
