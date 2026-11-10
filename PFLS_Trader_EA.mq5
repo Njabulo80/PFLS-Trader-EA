@@ -2,7 +2,7 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| MAIN EXPERT ADVISOR                                              |
-//| Version 2.00.3                                                   |
+//| Version 2.00.4                                                   |
 //|                                                                  |
 //| Multi-Timeframe Price Flow and Research Engine                   |
 //| Initial research target: Deriv Volatility 75 Index               |
@@ -13,7 +13,7 @@
 //+------------------------------------------------------------------+
 #property copyright "PFLS Trader"
 #property version   "2.00"
-#property description "PFLS 2.00 - Multi-Timeframe Research EA"
+#property description "PFLS 2.00.4 - Multi-Timeframe Research EA"
 
 //====================================================================
 // MODULES
@@ -67,21 +67,15 @@ ENUM_TIMEFRAMES PFLS_MainTimeframes[PFLS_MAIN_TIMEFRAME_COUNT] =
    PERIOD_M1
 };
 
-string PFLS_TimeframeNames[PFLS_MAIN_TIMEFRAME_COUNT] =
-{
-   "W1", "D1", "H4", "H1",
-   "M30", "M15", "M5", "M1"
-};
-
 //====================================================================
 // GLOBAL STATE
 //====================================================================
 
-PFLS_PriceFlowState    PFLS_Flow;
-PFLS_RiskConfig        PFLS_Risk;
-PFLS_TradePlan         PFLS_CurrentTradePlan;
-PFLS_EntryResult       PFLS_CurrentEntry;
-PFLS_ExecutionStatus   PFLS_Execution;
+PFLS_PriceFlowState  PFLS_Flow;
+PFLS_RiskConfig      PFLS_Risk;
+PFLS_TradePlan       PFLS_CurrentTradePlan;
+PFLS_EntryResult     PFLS_CurrentEntry;
+PFLS_ExecutionStatus PFLS_Execution;
 
 datetime PFLS_LastScanTime = 0;
 datetime PFLS_LastM5SignalTime = 0;
@@ -98,12 +92,6 @@ string PFLS_StatusMessage = "INITIALISING";
 // MITIGATED ZONE MEMORY
 //====================================================================
 
-// Prevent a zone touched during this running session from being
-// displayed again after a later timeframe rescan.
-//
-// The zone module separately maintains its own interaction history.
-// This additional list protects the active dashboard snapshots.
-
 #define PFLS_MAX_MITIGATED_ZONES 512
 
 datetime PFLS_MitigatedOrigin[PFLS_MAX_MITIGATED_ZONES];
@@ -116,12 +104,12 @@ int PFLS_MitigatedCount = 0;
 // LOGGING
 //====================================================================
 
-void PFLS_Log(string message)
+void PFLS_Log(const string message)
 {
    if(!InpEnableResearchLog)
       return;
 
-   Print("[PFLS 2.00] ", message);
+   Print("[PFLS 2.00.4] ", message);
 }
 
 //====================================================================
@@ -137,22 +125,32 @@ string PFLS_GetMarketSymbol()
 }
 
 //====================================================================
-// TIMEFRAME INDEX
+// SYMBOL DIGITS
 //====================================================================
 
-int PFLS_GetTimeframeIndex(ENUM_TIMEFRAMES timeframe)
+int PFLS_GetMarketDigits()
 {
-   for(int i = 0; i < PFLS_MAIN_TIMEFRAME_COUNT; i++)
-   {
-      if(PFLS_MainTimeframes[i] == timeframe)
-         return i;
-   }
+   string symbol = PFLS_GetMarketSymbol();
 
-   return -1;
+   long digits = 0;
+
+   if(!SymbolInfoInteger(symbol, SYMBOL_DIGITS, digits))
+      return _Digits;
+
+   return (int)digits;
 }
 
 //====================================================================
-// MITIGATED ZONE REGISTRATION
+// SYMBOL PRICE TEXT
+//====================================================================
+
+string PFLS_PriceText(const double price)
+{
+   return DoubleToString(price, PFLS_GetMarketDigits());
+}
+
+//====================================================================
+// MITIGATED ZONE LOOKUP
 //====================================================================
 
 bool PFLS_IsZonePreviouslyMitigated(
@@ -172,7 +170,9 @@ bool PFLS_IsZonePreviouslyMitigated(
    return false;
 }
 
-//--------------------------------------------------------------------
+//====================================================================
+// REGISTER MITIGATED ZONE
+//====================================================================
 
 void PFLS_RegisterMitigatedZone(
    const PFLS_ZoneRecord &zone
@@ -185,7 +185,10 @@ void PFLS_RegisterMitigatedZone(
       return;
 
    if(PFLS_MitigatedCount >= PFLS_MAX_MITIGATED_ZONES)
+   {
+      PFLS_Log("MITIGATED ZONE MEMORY FULL");
       return;
+   }
 
    PFLS_MitigatedOrigin[PFLS_MitigatedCount] =
       zone.origin_time;
@@ -206,7 +209,9 @@ void PFLS_RegisterMitigatedZone(
    );
 }
 
-//--------------------------------------------------------------------
+//====================================================================
+// FILTER MITIGATED ZONE
+//====================================================================
 
 void PFLS_FilterMitigatedZone(
    PFLS_ZoneRecord &zone
@@ -223,7 +228,7 @@ void PFLS_FilterMitigatedZone(
 }
 
 //====================================================================
-// APPLY ZONE FILTERS
+// FILTER ALL MITIGATED ZONES
 //====================================================================
 
 void PFLS_FilterAllMitigatedZones()
@@ -250,12 +255,11 @@ void PFLS_UpdateLiveZoneInteractions(
    const datetime event_time
 )
 {
-   if(previous_price <= 0 || current_price <= 0)
+   if(previous_price <= 0.0 || current_price <= 0.0)
       return;
 
    for(int i = 0; i < PFLS_MAIN_TIMEFRAME_COUNT; i++)
    {
-      // DEMAND
       if(PFLS_Flow.ladder[i].demand.active)
       {
          PFLS_UpdateZoneInteractionPath(
@@ -273,7 +277,6 @@ void PFLS_UpdateLiveZoneInteractions(
          }
       }
 
-      // SUPPLY
       if(PFLS_Flow.ladder[i].supply.active)
       {
          PFLS_UpdateZoneInteractionPath(
@@ -296,7 +299,7 @@ void PFLS_UpdateLiveZoneInteractions(
 }
 
 //====================================================================
-// OBJECTIVE INTERACTION
+// LIVE OBJECTIVE INTERACTION
 //====================================================================
 
 void PFLS_UpdateLiveObjective(
@@ -308,14 +311,15 @@ void PFLS_UpdateLiveObjective(
    if(!PFLS_Flow.objective.valid)
       return;
 
-   if(previous_price <= 0 || current_price <= 0)
+   if(previous_price <= 0.0 || current_price <= 0.0)
       return;
 
+   // Correct Price Flow interface:
+   // Pass the complete PFLS_PriceFlowState.
    PFLS_UpdateObjectiveInteractionPath(
-      PFLS_Flow.objective,
+      PFLS_Flow,
       previous_price,
       current_price,
-      PFLS_Flow.d1_bias,
       event_time
    );
 }
@@ -332,6 +336,9 @@ bool PFLS_RunPriceFlowScan()
    {
       PFLS_StatusMessage = "MARKET SYMBOL NOT AVAILABLE";
       PFLS_DataAvailable = false;
+
+      PFLS_Log("SYMBOL SELECTION FAILED");
+
       return false;
    }
 
@@ -346,10 +353,11 @@ bool PFLS_RunPriceFlowScan()
    {
       PFLS_StatusMessage = "WAITING FOR MULTI-TIMEFRAME DATA";
       PFLS_DataAvailable = false;
+
       return false;
    }
 
-   // Remove zones already touched during this session.
+   // Keep previously touched zones excluded after rescanning.
    PFLS_FilterAllMitigatedZones();
 
    PFLS_LastScanTime = TimeCurrent();
@@ -373,13 +381,13 @@ void PFLS_RunEntryResearch()
    {
       PFLS_ResetEntryResult(PFLS_CurrentEntry);
       PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+
       return;
    }
 
    if(!PFLS_DataAvailable)
       return;
 
-   // Entry hypotheses require directional permission.
    if(!PFLS_Flow.directional_objective_allowed)
    {
       PFLS_ResetEntryResult(PFLS_CurrentEntry);
@@ -388,7 +396,6 @@ void PFLS_RunEntryResearch()
       return;
    }
 
-   // An observation-only objective is not an entry target.
    if(!PFLS_Flow.objective.valid ||
       PFLS_Flow.objective.status == PFLS_OBJECTIVE_OBSERVATION_ONLY ||
       PFLS_Flow.objective.status == PFLS_OBJECTIVE_INVALIDATED ||
@@ -400,24 +407,26 @@ void PFLS_RunEntryResearch()
       return;
    }
 
+   string symbol = PFLS_GetMarketSymbol();
+
    MqlRates m5_rates[];
 
    ArraySetAsSeries(m5_rates, true);
 
    int copied = CopyRates(
-      PFLS_GetMarketSymbol(),
+      symbol,
       PERIOD_M5,
       0,
       InpLookbackBars,
       m5_rates
    );
 
-   if(copied < 20)
+   if(copied < 4)
       return;
 
    PFLS_EntryResult candidate;
 
-   ZeroMemory(candidate);
+   PFLS_ResetEntryResult(candidate);
 
    bool evaluated = PFLS_EvaluateEntry(
       m5_rates,
@@ -432,13 +441,9 @@ void PFLS_RunEntryResearch()
    );
 
    if(!evaluated || !candidate.valid)
-   {
-      PFLS_ResetEntryResult(PFLS_CurrentEntry);
-      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
       return;
-   }
 
-   // Avoid repeatedly recording the same completed M5 signal.
+   // Avoid recording the same completed M5 confirmation twice.
    if(candidate.confirmation_time <= PFLS_LastM5SignalTime)
       return;
 
@@ -446,12 +451,14 @@ void PFLS_RunEntryResearch()
 
    PFLS_CurrentEntry = candidate;
 
+   // A new candidate invalidates the previous research plan.
+   PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
+
    PFLS_Log(
       "NEW M5 ENTRY HYPOTHESIS | " +
       candidate.explanation
    );
 
-   // Determine the target from the selected objective.
    double objective_target = 0.0;
 
    if(candidate.signal == PFLS_ENTRY_BUY_CANDIDATE &&
@@ -465,17 +472,14 @@ void PFLS_RunEntryResearch()
       objective_target = candidate.objective_upper;
    }
 
-   if(objective_target <= 0)
+   if(objective_target <= 0.0)
    {
-      PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
       PFLS_Log("TRADE PLAN NOT BUILT: INVALID OBJECTIVE TARGET");
       return;
    }
 
-   PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
-
    bool plan_created = PFLS_BuildTradePlan(
-      PFLS_GetMarketSymbol(),
+      symbol,
       PFLS_CurrentEntry,
       PFLS_Risk,
       objective_target,
@@ -511,9 +515,7 @@ void PFLS_UpdateExecutionSafety()
       PFLS_Execution
    );
 
-   // Independent permanent execution lock.
-   // This research build never sends orders.
-
+   // This research EA must never place orders.
    if(PFLS_IsOrderExecutionAllowed(PFLS_Execution))
    {
       PFLS_Log("UNEXPECTED EXECUTION AUTHORIZATION STATE");
@@ -521,7 +523,7 @@ void PFLS_UpdateExecutionSafety()
 }
 
 //====================================================================
-// DASHBOARD HELPERS
+// ZONE TEXT
 //====================================================================
 
 string PFLS_ZoneText(const PFLS_ZoneRecord &zone)
@@ -529,13 +531,16 @@ string PFLS_ZoneText(const PFLS_ZoneRecord &zone)
    if(!zone.active)
       return "NO ACTIVE FRESH ZONE";
 
-   return
-      DoubleToString(zone.lower, _Digits) +
+   return (
+      PFLS_PriceText(zone.lower) +
       " - " +
-      DoubleToString(zone.upper, _Digits);
+      PFLS_PriceText(zone.upper)
+   );
 }
 
-//--------------------------------------------------------------------
+//====================================================================
+// OBJECTIVE TEXT
+//====================================================================
 
 string PFLS_ObjectiveText()
 {
@@ -547,33 +552,36 @@ string PFLS_ObjectiveText()
       "SUPPLY ABOVE" :
       "DEMAND BELOW";
 
-   return
+   string status =
+      PFLS_ObjectiveStatusText(
+         PFLS_Flow.objective.status
+      );
+
+   return (
       direction +
       " | " +
       EnumToString(PFLS_Flow.objective.source_timeframe) +
       " | " +
-      DoubleToString(PFLS_Flow.objective.lower, _Digits) +
+      PFLS_PriceText(PFLS_Flow.objective.lower) +
       " - " +
-      DoubleToString(PFLS_Flow.objective.upper, _Digits);
+      PFLS_PriceText(PFLS_Flow.objective.upper) +
+      " | " +
+      status
+   );
 }
 
-//--------------------------------------------------------------------
+//====================================================================
+// ENTRY TEXT
+//====================================================================
 
 string PFLS_EntryText()
 {
    if(!PFLS_CurrentEntry.valid)
       return "NO CONFIRMED ENTRY HYPOTHESIS";
 
-   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_BUY_CANDIDATE)
-      return "BUY CANDIDATE";
-
-   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_SELL_CANDIDATE)
-      return "SELL CANDIDATE";
-
-   if(PFLS_CurrentEntry.signal == PFLS_ENTRY_AMBIGUOUS)
-      return "AMBIGUOUS SIGNAL";
-
-   return "NO ENTRY";
+   return PFLS_EntrySignalText(
+      PFLS_CurrentEntry.signal
+   );
 }
 
 //====================================================================
@@ -600,7 +608,7 @@ void PFLS_UpdateDashboard()
 
    dashboard +=
       "PRICE: " +
-      DoubleToString(bid, _Digits) +
+      PFLS_PriceText(bid) +
       "\n";
 
    dashboard +=
@@ -639,14 +647,19 @@ void PFLS_UpdateDashboard()
    dashboard +=
       "OBJECTIVE: " +
       PFLS_ObjectiveText() +
-      "\n";
-
-   dashboard +=
-      "OBJECTIVE STATUS: " +
-      PFLS_ObjectiveStatusText(PFLS_Flow.objective.status) +
       "\n\n";
 
    dashboard += "---------- ACTIVE ZONES ----------\n";
+
+   dashboard +=
+      "W1 DEMAND: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[0].demand) +
+      "\n";
+
+   dashboard +=
+      "W1 SUPPLY: " +
+      PFLS_ZoneText(PFLS_Flow.ladder[0].supply) +
+      "\n";
 
    dashboard +=
       "D1 DEMAND: " +
@@ -703,18 +716,28 @@ void PFLS_UpdateDashboard()
    {
       dashboard +=
          "ENTRY: " +
-         DoubleToString(PFLS_CurrentTradePlan.entry_price, _Digits) +
+         PFLS_PriceText(PFLS_CurrentTradePlan.entry_price) +
          "\n";
 
       dashboard +=
          "STOP: " +
-         DoubleToString(PFLS_CurrentTradePlan.stop_loss, _Digits) +
+         PFLS_PriceText(PFLS_CurrentTradePlan.stop_loss) +
          "\n";
 
       dashboard +=
          "TARGET: " +
-         DoubleToString(PFLS_CurrentTradePlan.take_profit, _Digits) +
+         PFLS_PriceText(PFLS_CurrentTradePlan.take_profit) +
          "\n";
+
+      dashboard +=
+         "VOLUME: " +
+         DoubleToString(PFLS_CurrentTradePlan.volume, 2) +
+         "\n";
+
+      dashboard +=
+         "ESTIMATED RISK: " +
+         DoubleToString(PFLS_CurrentTradePlan.estimated_risk_percent, 2) +
+         "%\n";
 
       dashboard +=
          "RISK/REWARD: 1:" +
@@ -797,7 +820,8 @@ int OnInit()
 
    if(InpLookbackBars < 50 ||
       InpPivotStrength < 1 ||
-      InpScanIntervalSeconds < 1)
+      InpScanIntervalSeconds < 1 ||
+      InpMinimumWickRatio <= 0.0)
    {
       Print("PFLS INITIALISATION FAILED: INVALID INPUT SETTINGS");
       return INIT_PARAMETERS_INCORRECT;
@@ -812,38 +836,47 @@ int OnInit()
    // Initialise risk configuration.
    PFLS_ResetRiskConfig(PFLS_Risk);
 
-   // Execution remains disabled regardless of user inputs.
+   // Permanent research-only execution configuration.
    PFLS_Risk.execution_enabled = false;
    PFLS_Risk.emergency_stop = InpEmergencyStop;
 
-   PFLS_ValidateRiskConfig(PFLS_Risk);
+   if(!PFLS_ValidateRiskConfig(PFLS_Risk))
+   {
+      Print("PFLS INITIALISATION FAILED: RISK CONFIGURATION INVALID");
+      return INIT_FAILED;
+   }
 
+   PFLS_ResetEntryResult(PFLS_CurrentEntry);
    PFLS_ResetTradePlan(PFLS_CurrentTradePlan);
-
    PFLS_ResetExecutionStatus(PFLS_Execution);
-
-   ZeroMemory(PFLS_CurrentEntry);
 
    PFLS_MitigatedCount = 0;
 
    PFLS_PreviousTickPrice = 0.0;
    PFLS_CurrentTickPrice = 0.0;
 
+   PFLS_LastM5SignalTime = 0;
+   PFLS_LastScanTime = 0;
+
    PFLS_Initialised = true;
 
-   // First research scan.
    PFLS_RunPriceFlowScan();
 
-   // Execution inspection.
    PFLS_UpdateExecutionSafety();
 
-   // Timer-based research updates.
-   EventSetTimer(InpScanIntervalSeconds);
+   if(!EventSetTimer(InpScanIntervalSeconds))
+   {
+      PFLS_Initialised = false;
+
+      Print("PFLS INITIALISATION FAILED: TIMER COULD NOT START");
+
+      return INIT_FAILED;
+   }
 
    PFLS_UpdateDashboard();
 
-   PFLS_Log("PFLS TRADER 2.00 INITIALISED");
-   PFLS_Log("RESEARCH MODE - ORDER EXECUTION DISABLED");
+   PFLS_Log("PFLS TRADER 2.00.4 INITIALISED");
+   PFLS_Log("RESEARCH MODE - ORDER EXECUTION PERMANENTLY DISABLED");
 
    return INIT_SUCCEEDED;
 }
@@ -883,22 +916,19 @@ void OnTick()
       return;
 
    PFLS_PreviousTickPrice = PFLS_CurrentTickPrice;
-
    PFLS_CurrentTickPrice = tick.bid;
 
-   if(PFLS_PreviousTickPrice > 0 &&
-      PFLS_CurrentTickPrice > 0)
+   if(PFLS_PreviousTickPrice > 0.0 &&
+      PFLS_CurrentTickPrice > 0.0)
    {
       datetime event_time = TimeCurrent();
 
-      // Track zone first-touch events on incoming ticks.
       PFLS_UpdateLiveZoneInteractions(
          PFLS_PreviousTickPrice,
          PFLS_CurrentTickPrice,
          event_time
       );
 
-      // Track objective interaction independently.
       PFLS_UpdateLiveObjective(
          PFLS_PreviousTickPrice,
          PFLS_CurrentTickPrice,
