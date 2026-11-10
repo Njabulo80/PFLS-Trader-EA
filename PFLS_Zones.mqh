@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| ZONE DETECTION MODULE                                            |
-//| Version 2.00.2                                                   |
+//| Version 2.00.3                                                   |
 //|                                                                  |
 //| Research only. No trade execution.                               |
 //|                                                                  |
@@ -15,10 +15,11 @@
 //| - Corrected origin selection                                     |
 //| - First-entry mitigation detection                               |
 //| - Historical zone record support                                 |
-//| - Live price interaction monitoring                              |
+//| - Price-path interaction detection                               |
+//| - Correct partial/full traversal lifecycle                      |
 //+------------------------------------------------------------------+
 
-#define PFLS_ZONE_MODULE_VERSION "2.00.2"
+#define PFLS_ZONE_MODULE_VERSION "2.00.3"
 
 #ifndef PFLS_ZONE_HISTORY_CAPACITY
 #define PFLS_ZONE_HISTORY_CAPACITY 512
@@ -39,7 +40,7 @@ enum PFLS_ZONE_STATE
 
 //====================================================================
 // ACTIVE ZONE RECORD
-// Keep this interface compatible with File 4.
+// Keep compatible with File 4.
 //====================================================================
 
 struct PFLS_ZoneRecord
@@ -223,8 +224,8 @@ bool PFLS_IsPivotLow(
 
 //====================================================================
 // FIND DEMAND ORIGIN
-// Find the most recent bearish candle before the break.
-// The breakout candle is excluded.
+// Most recent bearish candle between pivot and breakout.
+// The breakout candle at index 1 is excluded.
 //====================================================================
 
 int PFLS_FindDemandOrigin(
@@ -317,9 +318,42 @@ bool PFLS_PricesIntersectZone(
 }
 
 //====================================================================
+// PRICE PATH INTERSECTION
+// Detects a tick moving through a zone even if neither
+// endpoint is inside the zone.
+//====================================================================
+
+bool PFLS_PricePathIntersectsZone(
+   const double previous_price,
+   const double current_price,
+   const double upper,
+   const double lower)
+{
+   if(upper <= lower ||
+      previous_price <= 0.0 ||
+      current_price <= 0.0)
+   {
+      return false;
+   }
+
+   double path_high = MathMax(
+      previous_price,
+      current_price);
+
+   double path_low = MathMin(
+      previous_price,
+      current_price);
+
+   return PFLS_PricesIntersectZone(
+      path_high,
+      path_low,
+      upper,
+      lower);
+}
+
+//====================================================================
 // FIRST-ENTRY FRESHNESS VALIDATION
-// Checks candles AFTER the origin, excluding the
-// most recent breakout candle at index 1.
+// Checks candles after origin, excluding index 1.
 //====================================================================
 
 bool PFLS_IsZoneFresh(
@@ -406,13 +440,15 @@ int PFLS_AddZoneHistoryRecord(
 
    PFLS_ZoneHistory[index].origin_time = zone.origin_time;
    PFLS_ZoneHistory[index].detection_time = zone.detection_time;
+   PFLS_ZoneHistory[index].first_touch_time =
+      zone.first_touch_time;
 
    PFLS_ZoneHistory[index].timeframe = zone.timeframe;
 
    PFLS_ZoneHistory[index].state = zone.state;
 
    PFLS_ZoneHistory[index].deepest_price =
-      zone.is_demand ? zone.lower : zone.upper;
+      zone.is_demand ? zone.upper : zone.lower;
 
    PFLS_ZoneHistoryCount++;
 
@@ -420,44 +456,166 @@ int PFLS_AddZoneHistoryRecord(
 }
 
 //====================================================================
-// UPDATE ZONE LIFECYCLE FROM PRICE
+// UPDATE HISTORY RECORD FROM A PRICE PATH
+//====================================================================
+
+void PFLS_UpdateHistoricalZonePath(
+   const int index,
+   const double previous_price,
+   const double current_price,
+   const datetime event_time)
+{
+   if(index < 0 ||
+      index >= PFLS_ZoneHistoryCount ||
+      !PFLS_ZoneHistory[index].valid ||
+      previous_price <= 0.0 ||
+      current_price <= 0.0)
+   {
+      return;
+   }
+
+   double upper = PFLS_ZoneHistory[index].upper;
+   double lower = PFLS_ZoneHistory[index].lower;
+
+   bool demand = PFLS_ZoneHistory[index].is_demand;
+
+   if(upper <= lower)
+      return;
+
+   bool intersects = PFLS_PricePathIntersectsZone(
+      previous_price,
+      current_price,
+      upper,
+      lower);
+
+   // No first interaction has occurred yet.
+   if(PFLS_ZoneHistory[index].first_touch_time == 0)
+   {
+      if(!intersects)
+         return;
+
+      PFLS_ZoneHistory[index].first_touch_time =
+         event_time;
+
+      PFLS_ZoneHistory[index].state =
+         PFLS_ZONE_TOUCHED;
+   }
+
+   PFLS_ZoneHistory[index].last_update_time =
+      event_time;
+
+   // Track deepest penetration.
+   if(demand)
+   {
+      if(current_price < PFLS_ZoneHistory[index].deepest_price)
+      {
+         PFLS_ZoneHistory[index].deepest_price =
+            current_price;
+      }
+
+      // Demand is fully traversed when price reaches
+      // or passes the lower boundary.
+      if(current_price <= lower)
+      {
+         PFLS_ZoneHistory[index].state =
+            PFLS_ZONE_FULLY_TRAVERSED;
+      }
+      else if(current_price < upper)
+      {
+         PFLS_ZoneHistory[index].state =
+            PFLS_ZONE_PARTIALLY_PENETRATED;
+      }
+   }
+   else
+   {
+      if(current_price > PFLS_ZoneHistory[index].deepest_price)
+      {
+         PFLS_ZoneHistory[index].deepest_price =
+            current_price;
+      }
+
+      // Supply is fully traversed when price reaches
+      // or passes the upper boundary.
+      if(current_price >= upper)
+      {
+         PFLS_ZoneHistory[index].state =
+            PFLS_ZONE_FULLY_TRAVERSED;
+      }
+      else if(current_price > lower)
+      {
+         PFLS_ZoneHistory[index].state =
+            PFLS_ZONE_PARTIALLY_PENETRATED;
+      }
+   }
+}
+
+//====================================================================
+// LEGACY HISTORY UPDATE
+// Preserves the original function interface.
+//====================================================================
+
+void PFLS_UpdateHistoricalZone(
+   const int index,
+   const double current_price,
+   const datetime event_time)
+{
+   PFLS_UpdateHistoricalZonePath(
+      index,
+      current_price,
+      current_price,
+      event_time);
+}
+
+//====================================================================
+// UPDATE ACTIVE ZONE FROM PRICE PATH
 // First entry hides the zone from active display.
 // Historical record remains available.
 //====================================================================
 
-bool PFLS_UpdateZoneInteraction(
+bool PFLS_UpdateZoneInteractionPath(
    PFLS_ZoneRecord &zone,
+   const double previous_price,
    const double current_price,
    const datetime event_time)
 {
-   if(!zone.active || current_price <= 0.0)
+   if(!zone.active ||
+      previous_price <= 0.0 ||
+      current_price <= 0.0)
+   {
       return false;
+   }
 
-   bool entered =
-      (current_price >= zone.lower &&
-       current_price <= zone.upper);
+   bool entered = PFLS_PricePathIntersectsZone(
+      previous_price,
+      current_price,
+      zone.upper,
+      zone.lower);
 
    if(!entered)
       return false;
 
-   zone.first_touch_time = event_time;
-   zone.state = PFLS_ZONE_TOUCHED;
-
-   int history_index = PFLS_FindZoneHistoryRecord(
-      zone.origin_time,
-      zone.timeframe,
-      zone.is_demand);
+   // Ensure the historical record exists before
+   // removing the zone from the active list.
+   int history_index = PFLS_AddZoneHistoryRecord(zone);
 
    if(history_index >= 0)
    {
-      PFLS_ZoneHistory[history_index].first_touch_time =
-         event_time;
+      PFLS_UpdateHistoricalZonePath(
+         history_index,
+         previous_price,
+         current_price,
+         event_time);
 
-      PFLS_ZoneHistory[history_index].last_update_time =
-         event_time;
+      zone.first_touch_time =
+         PFLS_ZoneHistory[history_index].first_touch_time;
 
-      PFLS_ZoneHistory[history_index].state =
-         PFLS_ZONE_TOUCHED;
+      zone.state =
+         PFLS_ZoneHistory[history_index].state;
+   }
+   else
+   {
+      zone.first_touch_time = event_time;
+      zone.state = PFLS_ZONE_TOUCHED;
    }
 
    zone.active = false;
@@ -466,59 +624,21 @@ bool PFLS_UpdateZoneInteraction(
 }
 
 //====================================================================
-// UPDATE HISTORICAL ZONE USING PRICE
+// LEGACY ACTIVE ZONE UPDATE
+// Preserves the original function interface.
+// Use the path version when previous price is available.
 //====================================================================
 
-void PFLS_UpdateHistoricalZone(
-   const int index,
+bool PFLS_UpdateZoneInteraction(
+   PFLS_ZoneRecord &zone,
    const double current_price,
    const datetime event_time)
 {
-   if(index < 0 ||
-      index >= PFLS_ZoneHistoryCount ||
-      !PFLS_ZoneHistory[index].valid ||
-      current_price <= 0.0)
-   {
-      return;
-   }
-
-   PFLS_ZoneHistoryRecord &zone =
-      PFLS_ZoneHistory[index];
-
-   zone.last_update_time = event_time;
-
-   if(current_price < zone.lower ||
-      current_price > zone.upper)
-   {
-      return;
-   }
-
-   if(zone.first_touch_time == 0)
-   {
-      zone.first_touch_time = event_time;
-      zone.state = PFLS_ZONE_TOUCHED;
-   }
-
-   if(zone.is_demand)
-   {
-      if(current_price < zone.deepest_price)
-         zone.deepest_price = current_price;
-
-      if(current_price <= zone.lower)
-         zone.state = PFLS_ZONE_FULLY_TRAVERSED;
-      else
-         zone.state = PFLS_ZONE_PARTIALLY_PENETRATED;
-   }
-   else
-   {
-      if(current_price > zone.deepest_price)
-         zone.deepest_price = current_price;
-
-      if(current_price >= zone.upper)
-         zone.state = PFLS_ZONE_FULLY_TRAVERSED;
-      else
-         zone.state = PFLS_ZONE_PARTIALLY_PENETRATED;
-   }
+   return PFLS_UpdateZoneInteractionPath(
+      zone,
+      current_price,
+      current_price,
+      event_time);
 }
 
 //====================================================================
