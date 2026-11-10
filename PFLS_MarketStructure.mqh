@@ -5,23 +5,24 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| MARKET STRUCTURE MODULE                                          |
-//| Version 2.00.1                                                   |
+//| Version 2.00.2                                                   |
 //|                                                                  |
-//| Functions:                                                       |
-//| - Confirmed swing high / low detection                           |
-//| - Higher High / Higher Low observations                          |
-//| - Lower High / Lower Low observations                            |
-//| - Bullish and bearish BOS                                       |
-//| - Structural directional bias                                    |
-//| - Provisional bias and invalidation monitoring                    |
+//| Improvements:                                                    |
+//| - Confirmed swing detection                                      |
+//| - HH / HL / LH / LL classification                               |
+//| - Newly occurring BOS detection                                 |
+//| - Protected swing tracking                                       |
+//| - Provisional directional bias                                   |
+//| - Two-close structural invalidation                              |
 //|                                                                  |
-//| Research module only. No trade execution.                        |
+//| RESEARCH ONLY. NO TRADE EXECUTION.                               |
+//| Assumes MqlRates arrays use series indexing.                     |
 //+------------------------------------------------------------------+
 
-#define PFLS_STRUCTURE_MODULE_VERSION "2.00.1"
+#define PFLS_STRUCTURE_MODULE_VERSION "2.00.2"
 
 //====================================================================
-// STRUCTURE ENUMERATIONS
+// ENUMERATIONS
 //====================================================================
 
 enum PFLS_DIRECTION
@@ -82,6 +83,9 @@ struct PFLS_MarketStructure
    PFLS_DIRECTION direction;
 
    PFLS_STRUCTURE_EVENT latest_event;
+
+   datetime bos_time;
+   double   bos_level;
 
    datetime analysis_time;
 };
@@ -146,6 +150,9 @@ void PFLS_ResetMarketStructure(
 
    structure.latest_event = PFLS_EVENT_NONE;
 
+   structure.bos_time = 0;
+   structure.bos_level = 0.0;
+
    structure.analysis_time = 0;
 }
 
@@ -192,9 +199,11 @@ bool PFLS_MS_IsPivotHigh(
 
    for(int i = 1; i <= strength; i++)
    {
+      // More recent candles.
       if(rates[index-i].high >= pivot)
          return false;
 
+      // Older candles.
       if(rates[index+i].high > pivot)
          return false;
    }
@@ -250,6 +259,9 @@ int PFLS_FindSwingHighs(
    PFLS_ResetSwing(latest);
    PFLS_ResetSwing(previous);
 
+   if(total < 3 || strength < 1 || lookback < 1)
+      return 0;
+
    int maximum_index = total - strength - 1;
 
    if(maximum_index > lookback)
@@ -274,7 +286,7 @@ int PFLS_FindSwingHighs(
          latest.time = rates[i].time;
          latest.bar_index = i;
 
-         found++;
+         found = 1;
       }
       else
       {
@@ -283,7 +295,7 @@ int PFLS_FindSwingHighs(
          previous.time = rates[i].time;
          previous.bar_index = i;
 
-         found++;
+         found = 2;
          break;
       }
    }
@@ -305,6 +317,9 @@ int PFLS_FindSwingLows(
 {
    PFLS_ResetSwing(latest);
    PFLS_ResetSwing(previous);
+
+   if(total < 3 || strength < 1 || lookback < 1)
+      return 0;
 
    int maximum_index = total - strength - 1;
 
@@ -330,7 +345,7 @@ int PFLS_FindSwingLows(
          latest.time = rates[i].time;
          latest.bar_index = i;
 
-         found++;
+         found = 1;
       }
       else
       {
@@ -339,7 +354,7 @@ int PFLS_FindSwingLows(
          previous.time = rates[i].time;
          previous.bar_index = i;
 
-         found++;
+         found = 2;
          break;
       }
    }
@@ -359,6 +374,8 @@ void PFLS_ClassifyStructure(
 
    structure.lower_high = false;
    structure.lower_low = false;
+
+   structure.latest_event = PFLS_EVENT_NONE;
 
    if(structure.latest_high.valid &&
       structure.previous_high.valid)
@@ -384,6 +401,34 @@ void PFLS_ClassifyStructure(
          structure.previous_low.price;
    }
 
+   // Determine the most recent classified swing event.
+   if(structure.latest_high.valid &&
+      structure.latest_low.valid)
+   {
+      if(structure.latest_high.time >
+         structure.latest_low.time)
+      {
+         if(structure.higher_high)
+            structure.latest_event =
+               PFLS_EVENT_HIGHER_HIGH;
+
+         else if(structure.lower_high)
+            structure.latest_event =
+               PFLS_EVENT_LOWER_HIGH;
+      }
+      else
+      {
+         if(structure.higher_low)
+            structure.latest_event =
+               PFLS_EVENT_HIGHER_LOW;
+
+         else if(structure.lower_low)
+            structure.latest_event =
+               PFLS_EVENT_LOWER_LOW;
+      }
+   }
+
+   // Establish the current structural classification.
    if(structure.higher_high &&
       structure.higher_low)
    {
@@ -406,17 +451,18 @@ void PFLS_ClassifyStructure(
       structure.direction = PFLS_DIRECTION_NEUTRAL;
    }
 
-   if(structure.latest_low.valid)
-      structure.protected_low =
-         structure.latest_low.price;
-
+   // Initial protected-level references.
    if(structure.latest_high.valid)
       structure.protected_high =
          structure.latest_high.price;
+
+   if(structure.latest_low.valid)
+      structure.protected_low =
+         structure.latest_low.price;
 }
 
 //====================================================================
-// DETECT STRUCTURE BREAK
+// DETECT A NEW STRUCTURE BREAK
 //====================================================================
 
 void PFLS_DetectStructureBreak(
@@ -427,28 +473,65 @@ void PFLS_DetectStructureBreak(
    structure.bullish_bos = false;
    structure.bearish_bos = false;
 
+   structure.bos_time = 0;
+   structure.bos_level = 0.0;
+
    if(total < 3)
       return;
 
+   // A bullish BOS requires a newly completed close
+   // crossing above the latest confirmed swing high.
    if(structure.latest_high.valid)
    {
-      if(rates[1].close >
-         structure.latest_high.price)
+      bool crossed_up =
+         (rates[2].close <= structure.latest_high.price &&
+          rates[1].close > structure.latest_high.price);
+
+      if(crossed_up)
       {
          structure.bullish_bos = true;
+
+         structure.bos_time = rates[1].time;
+         structure.bos_level =
+            structure.latest_high.price;
+
          structure.latest_event =
             PFLS_EVENT_BULLISH_BOS;
+
+         // The latest confirmed low becomes the
+         // provisional protected low for this break.
+         if(structure.latest_low.valid)
+         {
+            structure.protected_low =
+               structure.latest_low.price;
+         }
       }
    }
 
+   // A bearish BOS requires a newly completed close
+   // crossing below the latest confirmed swing low.
    if(structure.latest_low.valid)
    {
-      if(rates[1].close <
-         structure.latest_low.price)
+      bool crossed_down =
+         (rates[2].close >= structure.latest_low.price &&
+          rates[1].close < structure.latest_low.price);
+
+      if(crossed_down)
       {
          structure.bearish_bos = true;
+
+         structure.bos_time = rates[1].time;
+         structure.bos_level =
+            structure.latest_low.price;
+
          structure.latest_event =
             PFLS_EVENT_BEARISH_BOS;
+
+         if(structure.latest_high.valid)
+         {
+            structure.protected_high =
+               structure.latest_high.price;
+         }
       }
    }
 
@@ -558,7 +641,10 @@ bool PFLS_CreateProvisionalBias(
 
    bias.acceptance_closes = 0;
 
-   bias.created_time = TimeCurrent();
+   bias.created_time = structure.bos_time;
+
+   if(bias.created_time == 0)
+      bias.created_time = TimeCurrent();
 
    return true;
 }
@@ -579,8 +665,8 @@ bool PFLS_CheckProvisionalInvalidation(
       return false;
    }
 
-   // Two consecutive completed candle closes
-   // beyond the protected level invalidate the bias.
+   if(bias.protected_level <= 0.0)
+      return false;
 
    bool close_beyond = false;
 
@@ -596,6 +682,10 @@ bool PFLS_CheckProvisionalInvalidation(
          (rates[1].close > bias.protected_level &&
           rates[2].close > bias.protected_level);
    }
+   else
+   {
+      return false;
+   }
 
    if(close_beyond)
    {
@@ -608,6 +698,8 @@ bool PFLS_CheckProvisionalInvalidation(
 
       return true;
    }
+
+   bias.acceptance_closes = 0;
 
    return false;
 }
