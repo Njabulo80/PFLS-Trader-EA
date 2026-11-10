@@ -5,19 +5,24 @@
 //+------------------------------------------------------------------+
 //| PFLS TRADER 2.00                                                 |
 //| ZONE DETECTION MODULE                                            |
-//| Version 2.00.1                                                   |
+//| Version 2.00.2                                                   |
 //|                                                                  |
-//| Responsibilities:                                                |
-//| - Confirmed swing detection                                      |
-//| - Structure-break validation                                    |
-//| - Demand and supply origin identification                       |
-//| - Fresh-zone validation                                         |
+//| Research only. No trade execution.                               |
+//|                                                                  |
+//| Improvements:                                                    |
+//| - Confirmed pivot detection                                      |
+//| - Structural break validation                                    |
+//| - Corrected origin selection                                     |
 //| - First-entry mitigation detection                               |
-//|                                                                  |
-//| Research module. No trading commands.                            |
+//| - Historical zone record support                                 |
+//| - Live price interaction monitoring                              |
 //+------------------------------------------------------------------+
 
-#define PFLS_ZONE_MODULE_VERSION "2.00.1"
+#define PFLS_ZONE_MODULE_VERSION "2.00.2"
+
+#ifndef PFLS_ZONE_HISTORY_CAPACITY
+#define PFLS_ZONE_HISTORY_CAPACITY 512
+#endif
 
 //====================================================================
 // ZONE LIFECYCLE
@@ -33,7 +38,8 @@ enum PFLS_ZONE_STATE
 };
 
 //====================================================================
-// ZONE RECORD
+// ACTIVE ZONE RECORD
+// Keep this interface compatible with File 4.
 //====================================================================
 
 struct PFLS_ZoneRecord
@@ -54,7 +60,40 @@ struct PFLS_ZoneRecord
 };
 
 //====================================================================
-// RESET ZONE RECORD
+// HISTORICAL ZONE RECORD
+//====================================================================
+
+struct PFLS_ZoneHistoryRecord
+{
+   bool              valid;
+   bool              is_demand;
+
+   double            upper;
+   double            lower;
+
+   datetime          origin_time;
+   datetime          detection_time;
+   datetime          first_touch_time;
+   datetime          last_update_time;
+
+   ENUM_TIMEFRAMES   timeframe;
+
+   PFLS_ZONE_STATE   state;
+
+   double            deepest_price;
+};
+
+//====================================================================
+// HISTORY STORAGE
+//====================================================================
+
+PFLS_ZoneHistoryRecord
+   PFLS_ZoneHistory[PFLS_ZONE_HISTORY_CAPACITY];
+
+int PFLS_ZoneHistoryCount = 0;
+
+//====================================================================
+// RESET ACTIVE ZONE
 //====================================================================
 
 void PFLS_ResetZoneRecord(PFLS_ZoneRecord &zone)
@@ -75,13 +114,56 @@ void PFLS_ResetZoneRecord(PFLS_ZoneRecord &zone)
 }
 
 //====================================================================
+// RESET HISTORY RECORD
+//====================================================================
+
+void PFLS_ResetZoneHistoryRecord(
+   PFLS_ZoneHistoryRecord &zone)
+{
+   zone.valid = false;
+   zone.is_demand = false;
+
+   zone.upper = 0.0;
+   zone.lower = 0.0;
+
+   zone.origin_time = 0;
+   zone.detection_time = 0;
+   zone.first_touch_time = 0;
+   zone.last_update_time = 0;
+
+   zone.timeframe = PERIOD_CURRENT;
+
+   zone.state = PFLS_ZONE_INVALID;
+
+   zone.deepest_price = 0.0;
+}
+
+//====================================================================
+// INITIALISE HISTORY
+//====================================================================
+
+void PFLS_InitialiseZoneHistory()
+{
+   PFLS_ZoneHistoryCount = 0;
+
+   for(int i = 0;
+       i < PFLS_ZONE_HISTORY_CAPACITY;
+       i++)
+   {
+      PFLS_ResetZoneHistoryRecord(
+         PFLS_ZoneHistory[i]);
+   }
+}
+
+//====================================================================
 // CONFIRMED PIVOT HIGH
 //====================================================================
 
-bool PFLS_IsPivotHigh(const MqlRates &rates[],
-                      const int index,
-                      const int strength,
-                      const int total)
+bool PFLS_IsPivotHigh(
+   const MqlRates &rates[],
+   const int index,
+   const int strength,
+   const int total)
 {
    if(strength < 1)
       return false;
@@ -110,10 +192,11 @@ bool PFLS_IsPivotHigh(const MqlRates &rates[],
 // CONFIRMED PIVOT LOW
 //====================================================================
 
-bool PFLS_IsPivotLow(const MqlRates &rates[],
-                     const int index,
-                     const int strength,
-                     const int total)
+bool PFLS_IsPivotLow(
+   const MqlRates &rates[],
+   const int index,
+   const int strength,
+   const int total)
 {
    if(strength < 1)
       return false;
@@ -139,16 +222,19 @@ bool PFLS_IsPivotLow(const MqlRates &rates[],
 }
 
 //====================================================================
-// FIND DEMAND ORIGIN CANDLE
+// FIND DEMAND ORIGIN
+// Find the most recent bearish candle before the break.
+// The breakout candle is excluded.
 //====================================================================
 
-int PFLS_FindDemandOrigin(const MqlRates &rates[],
-                          const int pivot_index)
+int PFLS_FindDemandOrigin(
+   const MqlRates &rates[],
+   const int pivot_index)
 {
-   // Search from the pivot towards the latest completed candle.
-   // The last bearish candle is the primary demand origin.
+   if(pivot_index <= 2)
+      return -1;
 
-   for(int i = pivot_index - 1; i >= 2; i--)
+   for(int i = 2; i < pivot_index; i++)
    {
       if(rates[i].close < rates[i].open)
          return i;
@@ -158,15 +244,17 @@ int PFLS_FindDemandOrigin(const MqlRates &rates[],
 }
 
 //====================================================================
-// FIND SUPPLY ORIGIN CANDLE
+// FIND SUPPLY ORIGIN
 //====================================================================
 
-int PFLS_FindSupplyOrigin(const MqlRates &rates[],
-                          const int pivot_index)
+int PFLS_FindSupplyOrigin(
+   const MqlRates &rates[],
+   const int pivot_index)
 {
-   // The last bullish candle is the primary supply origin.
+   if(pivot_index <= 2)
+      return -1;
 
-   for(int i = pivot_index - 1; i >= 2; i--)
+   for(int i = 2; i < pivot_index; i++)
    {
       if(rates[i].close > rates[i].open)
          return i;
@@ -185,8 +273,9 @@ void PFLS_CalculateDemandBoundaries(
    double &upper,
    double &lower)
 {
-   upper = MathMax(rates[origin_index].open,
-                   rates[origin_index].close);
+   upper = MathMax(
+      rates[origin_index].open,
+      rates[origin_index].close);
 
    lower = rates[origin_index].low;
 }
@@ -203,39 +292,55 @@ void PFLS_CalculateSupplyBoundaries(
 {
    upper = rates[origin_index].high;
 
-   lower = MathMin(rates[origin_index].open,
-                   rates[origin_index].close);
+   lower = MathMin(
+      rates[origin_index].open,
+      rates[origin_index].close);
+}
+
+//====================================================================
+// PRICE INTERSECTION
+//====================================================================
+
+bool PFLS_PricesIntersectZone(
+   const double candle_high,
+   const double candle_low,
+   const double upper,
+   const double lower)
+{
+   if(upper <= lower)
+      return false;
+
+   return (
+      candle_high >= lower &&
+      candle_low <= upper
+   );
 }
 
 //====================================================================
 // FIRST-ENTRY FRESHNESS VALIDATION
+// Checks candles AFTER the origin, excluding the
+// most recent breakout candle at index 1.
 //====================================================================
 
-bool PFLS_IsZoneFresh(const MqlRates &rates[],
-                      const int origin_index,
-                      const double upper,
-                      const double lower,
-                      datetime &first_touch)
+bool PFLS_IsZoneFresh(
+   const MqlRates &rates[],
+   const int origin_index,
+   const double upper,
+   const double lower,
+   datetime &first_touch)
 {
    first_touch = 0;
 
    if(upper <= lower)
       return false;
 
-   // Series arrays:
-   // index 0 = currently forming candle
-   // index 1 = most recently completed candle
-   //
-   // Every completed candle after the origin is checked.
-   // Even a wick-only overlap counts as first interaction.
-
-   for(int i = origin_index - 1; i >= 1; i--)
+   for(int i = origin_index - 1; i >= 2; i--)
    {
-      bool intersects =
-         (rates[i].high >= lower &&
-          rates[i].low <= upper);
-
-      if(intersects)
+      if(PFLS_PricesIntersectZone(
+         rates[i].high,
+         rates[i].low,
+         upper,
+         lower))
       {
          first_touch = rates[i].time;
          return false;
@@ -243,6 +348,177 @@ bool PFLS_IsZoneFresh(const MqlRates &rates[],
    }
 
    return true;
+}
+
+//====================================================================
+// FIND HISTORY RECORD
+//====================================================================
+
+int PFLS_FindZoneHistoryRecord(
+   const datetime origin_time,
+   const ENUM_TIMEFRAMES timeframe,
+   const bool demand)
+{
+   for(int i = 0; i < PFLS_ZoneHistoryCount; i++)
+   {
+      if(!PFLS_ZoneHistory[i].valid)
+         continue;
+
+      if(PFLS_ZoneHistory[i].origin_time == origin_time &&
+         PFLS_ZoneHistory[i].timeframe == timeframe &&
+         PFLS_ZoneHistory[i].is_demand == demand)
+      {
+         return i;
+      }
+   }
+
+   return -1;
+}
+
+//====================================================================
+// ADD HISTORY RECORD
+//====================================================================
+
+int PFLS_AddZoneHistoryRecord(
+   const PFLS_ZoneRecord &zone)
+{
+   int existing = PFLS_FindZoneHistoryRecord(
+      zone.origin_time,
+      zone.timeframe,
+      zone.is_demand);
+
+   if(existing >= 0)
+      return existing;
+
+   if(PFLS_ZoneHistoryCount >= PFLS_ZONE_HISTORY_CAPACITY)
+      return -1;
+
+   int index = PFLS_ZoneHistoryCount;
+
+   PFLS_ResetZoneHistoryRecord(
+      PFLS_ZoneHistory[index]);
+
+   PFLS_ZoneHistory[index].valid = true;
+   PFLS_ZoneHistory[index].is_demand = zone.is_demand;
+
+   PFLS_ZoneHistory[index].upper = zone.upper;
+   PFLS_ZoneHistory[index].lower = zone.lower;
+
+   PFLS_ZoneHistory[index].origin_time = zone.origin_time;
+   PFLS_ZoneHistory[index].detection_time = zone.detection_time;
+
+   PFLS_ZoneHistory[index].timeframe = zone.timeframe;
+
+   PFLS_ZoneHistory[index].state = zone.state;
+
+   PFLS_ZoneHistory[index].deepest_price =
+      zone.is_demand ? zone.lower : zone.upper;
+
+   PFLS_ZoneHistoryCount++;
+
+   return index;
+}
+
+//====================================================================
+// UPDATE ZONE LIFECYCLE FROM PRICE
+// First entry hides the zone from active display.
+// Historical record remains available.
+//====================================================================
+
+bool PFLS_UpdateZoneInteraction(
+   PFLS_ZoneRecord &zone,
+   const double current_price,
+   const datetime event_time)
+{
+   if(!zone.active || current_price <= 0.0)
+      return false;
+
+   bool entered =
+      (current_price >= zone.lower &&
+       current_price <= zone.upper);
+
+   if(!entered)
+      return false;
+
+   zone.first_touch_time = event_time;
+   zone.state = PFLS_ZONE_TOUCHED;
+
+   int history_index = PFLS_FindZoneHistoryRecord(
+      zone.origin_time,
+      zone.timeframe,
+      zone.is_demand);
+
+   if(history_index >= 0)
+   {
+      PFLS_ZoneHistory[history_index].first_touch_time =
+         event_time;
+
+      PFLS_ZoneHistory[history_index].last_update_time =
+         event_time;
+
+      PFLS_ZoneHistory[history_index].state =
+         PFLS_ZONE_TOUCHED;
+   }
+
+   zone.active = false;
+
+   return true;
+}
+
+//====================================================================
+// UPDATE HISTORICAL ZONE USING PRICE
+//====================================================================
+
+void PFLS_UpdateHistoricalZone(
+   const int index,
+   const double current_price,
+   const datetime event_time)
+{
+   if(index < 0 ||
+      index >= PFLS_ZoneHistoryCount ||
+      !PFLS_ZoneHistory[index].valid ||
+      current_price <= 0.0)
+   {
+      return;
+   }
+
+   PFLS_ZoneHistoryRecord &zone =
+      PFLS_ZoneHistory[index];
+
+   zone.last_update_time = event_time;
+
+   if(current_price < zone.lower ||
+      current_price > zone.upper)
+   {
+      return;
+   }
+
+   if(zone.first_touch_time == 0)
+   {
+      zone.first_touch_time = event_time;
+      zone.state = PFLS_ZONE_TOUCHED;
+   }
+
+   if(zone.is_demand)
+   {
+      if(current_price < zone.deepest_price)
+         zone.deepest_price = current_price;
+
+      if(current_price <= zone.lower)
+         zone.state = PFLS_ZONE_FULLY_TRAVERSED;
+      else
+         zone.state = PFLS_ZONE_PARTIALLY_PENETRATED;
+   }
+   else
+   {
+      if(current_price > zone.deepest_price)
+         zone.deepest_price = current_price;
+
+      if(current_price >= zone.upper)
+         zone.state = PFLS_ZONE_FULLY_TRAVERSED;
+      else
+         zone.state = PFLS_ZONE_PARTIALLY_PENETRATED;
+   }
 }
 
 //====================================================================
@@ -268,7 +544,8 @@ bool PFLS_BuildFreshZone(
 
    int maximum_index = total - pivot_strength - 1;
 
-   int requested_maximum = lookback - pivot_strength - 2;
+   int requested_maximum =
+      lookback - pivot_strength - 2;
 
    if(maximum_index > requested_maximum)
       maximum_index = requested_maximum;
@@ -276,9 +553,8 @@ bool PFLS_BuildFreshZone(
    if(maximum_index <= pivot_strength + 1)
       return false;
 
-   // Search historical confirmed pivots.
-   // The latest completed candle must close beyond the pivot.
-
+   // Search from the most recent eligible historical
+   // pivot towards older pivots.
    for(int i = pivot_strength + 2;
        i <= maximum_index;
        i++)
@@ -287,24 +563,18 @@ bool PFLS_BuildFreshZone(
 
       if(demand)
       {
-         if(PFLS_IsPivotHigh(rates,
-                             i,
-                             pivot_strength,
-                             total))
+         if(PFLS_IsPivotHigh(
+            rates, i, pivot_strength, total))
          {
-            if(rates[1].close > rates[i].high)
-               broken = true;
+            broken = (rates[1].close > rates[i].high);
          }
       }
       else
       {
-         if(PFLS_IsPivotLow(rates,
-                            i,
-                            pivot_strength,
-                            total))
+         if(PFLS_IsPivotLow(
+            rates, i, pivot_strength, total))
          {
-            if(rates[1].close < rates[i].low)
-               broken = true;
+            broken = (rates[1].close < rates[i].low);
          }
       }
 
@@ -314,9 +584,15 @@ bool PFLS_BuildFreshZone(
       int origin_index = -1;
 
       if(demand)
-         origin_index = PFLS_FindDemandOrigin(rates, i);
+      {
+         origin_index = PFLS_FindDemandOrigin(
+            rates, i);
+      }
       else
-         origin_index = PFLS_FindSupplyOrigin(rates, i);
+      {
+         origin_index = PFLS_FindSupplyOrigin(
+            rates, i);
+      }
 
       if(origin_index < 0)
          continue;
@@ -362,12 +638,16 @@ bool PFLS_BuildFreshZone(
       result.upper = zone_upper;
       result.lower = zone_lower;
 
-      result.origin_time = rates[origin_index].time;
+      result.origin_time =
+         rates[origin_index].time;
+
       result.detection_time = TimeCurrent();
       result.first_touch_time = 0;
 
       result.timeframe = timeframe;
       result.state = PFLS_ZONE_UNTESTED;
+
+      PFLS_AddZoneHistoryRecord(result);
 
       return true;
    }
@@ -376,7 +656,7 @@ bool PFLS_BuildFreshZone(
 }
 
 //====================================================================
-// SCAN A TIMEFRAME FOR DEMAND AND SUPPLY
+// SCAN A TIMEFRAME
 //====================================================================
 
 bool PFLS_ScanZones(
@@ -389,6 +669,9 @@ bool PFLS_ScanZones(
 {
    PFLS_ResetZoneRecord(demand_zone);
    PFLS_ResetZoneRecord(supply_zone);
+
+   if(lookback < 50 || pivot_strength < 1)
+      return false;
 
    MqlRates rates[];
 
@@ -429,7 +712,8 @@ bool PFLS_ScanZones(
 // ZONE STATE DESCRIPTION
 //====================================================================
 
-string PFLS_ZoneStateText(const PFLS_ZONE_STATE state)
+string PFLS_ZoneStateText(
+   const PFLS_ZONE_STATE state)
 {
    switch(state)
    {
