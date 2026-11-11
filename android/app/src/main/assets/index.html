@@ -4,7 +4,7 @@
 :root{color-scheme:dark;--bg:#080d18;--panel:#101827;--line:#263449;--muted:#91a0b5;--green:#25d6a2;--red:#ff647c;--amber:#f2bd62}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf3fb;font:15px system-ui,sans-serif}main{max-width:760px;margin:auto;padding:18px 14px 30px}header,.row{display:flex;justify-content:space-between;align-items:center;gap:10px}h1{font-size:21px;margin:0}h2{font-size:15px;margin:0 0 12px}.muted,small{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:15px;margin:11px 0}.tag,.pill{font-size:11px;border:1px solid var(--line);border-radius:99px;padding:5px 9px;color:var(--muted)}.big{font-size:30px;font-weight:800;margin:7px 0}.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric{background:#0b1321;border:1px solid var(--line);padding:11px;border-radius:12px}.metric label{display:block;font-size:10px;color:var(--muted);margin-bottom:5px}.metric strong{font-size:17px}.bar{height:7px;background:#253247;border-radius:20px;overflow:hidden;margin-top:8px}.bar span{display:block;height:100%;background:var(--green);width:0}button,input{font:inherit;border-radius:10px;border:1px solid var(--line);padding:11px;background:#0b1321;color:#edf3fb}button{background:#153a38;border-color:#21685c;color:#cffff0;font-weight:700}.secondary{background:#172235;border-color:var(--line);color:#dce7f5}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions button{flex:1}input{width:100%;margin:7px 0 10px}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:9px 5px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:10px}.note{font-size:12px;line-height:1.5;color:var(--muted)}footer{text-align:center;margin:20px 0;color:var(--muted);font-size:11px}@media(min-width:560px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <header><div><h1>PFLS <span class="green">PREDICTOR</span></h1><small>Native Android · Deriv Volatility 75</small></div><span class="tag">EXECUTION OFF</span></header>
-<section class="card"><div class="row"><b>R_75 · Volatility 75 Index</b><span id="conn" class="amber">● CONNECTING</span></div><div class="row" style="margin-top:12px"><span class="muted">Live price</span><b id="price">—</b></div><div class="row" style="margin-top:5px"><span class="muted">Updated</span><span id="updated" class="muted">—</span></div><div class="actions" style="margin-top:12px"><button id="reconnect">Reconnect</button><button class="secondary" id="pause">Pause</button></div></section>
+<section class="card"><div class="row"><b>R_75 · Volatility 75 Index</b><span id="conn" class="amber">● CONNECTING</span></div><div class="row" style="margin-top:12px"><span class="muted">Live price</span><b id="price">—</b></div><div class="row" style="margin-top:5px"><span class="muted">Updated</span><span id="updated" class="muted">—</span></div><p id="connDetail" class="note" style="margin:9px 0 0">Preparing secure market-data connection…</p><div class="actions" style="margin-top:12px"><button id="reconnect">Reconnect</button><button class="secondary" id="pause">Pause</button></div></section>
 <section class="card"><h2>Next-move assessment</h2><div id="direction" class="big">WAITING</div><div id="summary" class="muted">Waiting for live candle history.</div><div class="grid" style="margin-top:13px"><div class="metric"><label>BULLISH EVIDENCE</label><strong id="bull">—</strong><div class="bar"><span id="bullbar"></span></div></div><div class="metric"><label>BEARISH EVIDENCE</label><strong id="bear">—</strong><div class="bar"><span id="bearbar" style="background:var(--red)"></span></div></div><div class="metric"><label>STRUCTURE BIAS</label><strong id="structure">—</strong></div><div class="metric"><label>ENTRY READINESS</label><strong id="ready">WAIT</strong></div></div><p class="note">Evidence scores are rule-based research scores, not calibrated probabilities or verified win rates.</p></section>
 <section class="card"><h2>Multi-timeframe ladder</h2><table><thead><tr><th>TF</th><th>BIAS</th><th>RSI</th></tr></thead><tbody id="ladder"><tr><td colspan="3">Loading data…</td></tr></tbody></table></section>
 <section class="card"><h2>Recent price references</h2><div class="grid"><div class="metric"><label>RECENT HIGH</label><strong id="high">—</strong></div><div class="metric"><label>RECENT LOW</label><strong id="low">—</strong></div><div class="metric"><label>M5 ATR</label><strong id="atr">—</strong></div><div class="metric"><label>M5 CLOSE</label><strong id="m5">—</strong></div></div><p class="note">Rolling highs/lows are reference levels, not confirmed supply/demand zones or guaranteed targets.</p></section>
@@ -15,18 +15,42 @@
 <script>
 (()=>{'use strict';
 const $=id=>document.getElementById(id),TF=[['W1',604800,1.4],['D1',86400,1.5],['H4',14400,1.3],['H1',3600,1.2],['M30',1800,1],['M15',900,1],['M5',300,1.2],['M1',60,.6]];
-let socket=null,paused=false,retry=0,retryTimer=null,pingTimer=null,req=0,feed={},lastTick=null,lastForecastBucket=0,journal=[];
+let socket=null,paused=false,retry=0,retryTimer=null,pingTimer=null,connectTimer=null,watchTimer=null,req=0,feed={},lastTick=null,lastMessageAt=0,lastForecastBucket=0,journal=[];
 try{journal=JSON.parse(localStorage.getItem('pfls.journal')||'[]')}catch(e){}
 const fmt=n=>Number.isFinite(n)?n.toFixed(2):'—',save=()=>{try{localStorage.setItem('pfls.journal',JSON.stringify(journal.slice(-250)))}catch(e){}};
+function detail(t){$('connDetail').textContent=t}
 function status(t,ok=false){$('conn').textContent='● '+t;$('conn').className=ok?'green':'amber'}
-function send(o){if(socket&&socket.readyState===1)socket.send(JSON.stringify(o))}
-function stopTimers(){if(pingTimer)clearInterval(pingTimer);if(retryTimer)clearTimeout(retryTimer);pingTimer=retryTimer=null}
-function connect(){paused=false;stopTimers();if(socket){socket.onclose=null;socket.close()}feed={};status('CONNECTING');let appid=$('appid').value.trim()||'1089';try{socket=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id='+encodeURIComponent(appid))}catch(e){status('SOCKET ERROR');return}
-socket.onopen=()=>{retry=0;status('CONNECTED · LOADING',true);send({ping:1});pingTimer=setInterval(()=>send({ping:1}),25000);TF.forEach(([name,gran],i)=>setTimeout(()=>send({ticks_history:'R_75',adjust_start_time:1,count:350,end:'latest',style:'candles',granularity:gran,subscribe:1,req_id:++req}),i*180));};
-socket.onmessage=e=>{let d;try{d=JSON.parse(e.data)}catch(_){return}if(d.error){status('API: '+d.error.message);return}if(d.candles){let g=Number(d.echo_req&&d.echo_req.granularity),tf=TF.find(x=>x[1]===g);if(tf)feed[tf[0]]=d.candles.map(c=>({t:+c.epoch,o:+c.open,h:+c.high,l:+c.low,c:+c.close}));render()}
-if(d.ohlc){let tf=TF.find(x=>x[1]===Number(d.ohlc.granularity));if(tf){let a=feed[tf[0]]||(feed[tf[0]]=[]),c=d.ohlc,v={t:+c.open_time,o:+c.open,h:+c.high,l:+c.low,c:+c.close},i=a.findIndex(x=>x.t===v.t);if(i>=0)a[i]=v;else a.push(v);if(a.length>500)a.shift();render()}}
-if(d.tick){lastTick=+d.tick.quote;$('price').textContent=fmt(lastTick);$('updated').textContent=new Date().toLocaleTimeString();status('LIVE · R_75',true)}};
-socket.onerror=()=>status('NETWORK ERROR');socket.onclose=()=>{stopTimers();if(!paused){status('DISCONNECTED · RETRYING');let delay=Math.min(30000,1500*Math.pow(2,retry++));retryTimer=setTimeout(connect,delay)}};
+function send(o){if(socket&&socket.readyState===1){try{socket.send(JSON.stringify(o));return true}catch(e){detail('Send failed: '+e.message)}}return false}
+function stopTimers(){[pingTimer,retryTimer,connectTimer,watchTimer].forEach(x=>{if(x){clearTimeout(x);clearInterval(x)}});pingTimer=retryTimer=connectTimer=watchTimer=null}
+function scheduleRetry(reason){if(paused)return;stopTimers();status('RETRYING');detail(reason+' · retrying automatically');let delay=Math.min(30000,2000*Math.pow(2,Math.min(retry++,4)));retryTimer=setTimeout(connect,delay)}
+function connect(){
+ paused=false;stopTimers();if(socket){socket.onopen=socket.onmessage=socket.onerror=socket.onclose=null;try{socket.close()}catch(e){}}
+ feed={};lastTick=null;$('price').textContent='—';$('updated').textContent='—';$('ladder').innerHTML='<tr><td colspan="3">Waiting for Deriv candle history…</td></tr>';
+ status('CONNECTING');detail('Opening secure connection to ws.derivws.com…');
+ let appid=$('appid').value.trim()||'1089';
+ if(!/^\d+$/.test(appid)){status('INVALID APP ID');detail('Enter a numeric Deriv application ID, then tap Reconnect.');return}
+ try{socket=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id='+encodeURIComponent(appid))}
+ catch(e){status('SOCKET ERROR');detail('Could not create WebSocket: '+e.message);scheduleRetry('Socket creation failed');return}
+ const active=socket;
+ connectTimer=setTimeout(()=>{if(active===socket&&active.readyState!==1){detail('Timed out before Deriv accepted the connection. Check network restrictions, VPN or Private DNS.');try{active.close()}catch(e){}scheduleRetry('Connection timeout')}},15000);
+ socket.onopen=()=>{
+  if(active!==socket)return;if(connectTimer)clearTimeout(connectTimer);connectTimer=null;retry=0;lastMessageAt=Date.now();
+  status('CONNECTED · REQUESTING DATA',true);detail('Secure connection established. Requesting R_75 candles for 8 timeframes…');
+  send({ping:1});
+  TF.forEach(([name,gran],i)=>setTimeout(()=>{if(active===socket&&active.readyState===1)send({ticks_history:'R_75',adjust_start_time:1,count:350,end:'latest',style:'candles',granularity:gran,subscribe:1,req_id:++req})},i*250));
+  pingTimer=setInterval(()=>{if(active===socket&&active.readyState===1)send({ping:1})},12000);
+  watchTimer=setInterval(()=>{if(active!==socket||paused)return;if(Date.now()-lastMessageAt>35000){detail('No server response for 35 seconds. Reconnecting…');try{active.close()}catch(e){scheduleRetry('Server response timeout')}}},10000);
+ };
+ socket.onmessage=e=>{
+  if(active!==socket)return;lastMessageAt=Date.now();let d;try{d=JSON.parse(e.data)}catch(_){detail('Received an unreadable response from Deriv.');return}
+  if(d.error){let msg=(d.error.code?d.error.code+': ':'')+(d.error.message||'Unknown API error');status('API ERROR');detail(msg+' · Check the app ID and Deriv API availability.');return}
+  if(d.msg_type==='ping'||d.ping)detail('Deriv server is responding. Waiting for market candles…');
+  if(d.candles){let g=Number(d.echo_req&&d.echo_req.granularity),tf=TF.find(x=>x[1]===g);if(tf)feed[tf[0]]=d.candles.map(c=>({t:+c.epoch,o:+c.open,h:+c.high,l:+c.low,c:+c.close}));let loaded=Object.keys(feed).length;status('CONNECTED · '+loaded+'/8 TF',true);detail(loaded+'/8 timeframe histories received. '+(loaded===8?'Market history loaded.':'Loading remaining timeframes…'));render()}
+  if(d.ohlc){let tf=TF.find(x=>x[1]===Number(d.ohlc.granularity));if(tf){let a=feed[tf[0]]||(feed[tf[0]]=[]),c=d.ohlc,v={t:+c.open_time,o:+c.open,h:+c.high,l:+c.low,c:+c.close},i=a.findIndex(x=>x.t===v.t);if(i>=0)a[i]=v;else a.push(v);if(a.length>500)a.shift();render()}}
+  if(d.tick){lastTick=+d.tick.quote;$('price').textContent=fmt(lastTick);$('updated').textContent=new Date().toLocaleTimeString();status('LIVE · R_75',true);detail('Live R_75 tick received. '+Object.keys(feed).length+'/8 timeframe histories loaded.')}
+ };
+ socket.onerror=()=>{if(active!==socket)return;status('NETWORK ERROR');detail('WebSocket network error. Android or the current network may be blocking the secure connection.')};
+ socket.onclose=e=>{if(active!==socket||paused)return;stopTimers();let reason=e.reason?(' · '+e.reason):'';let msg='Connection closed (code '+e.code+reason+').';status('DISCONNECTED');detail(msg);scheduleRetry(msg)};
 }
 function ema(a,p){if(a.length<p)return null;let k=2/(p+1),v=a.slice(0,p).reduce((s,x)=>s+x,0)/p;for(let i=p;i<a.length;i++)v=a[i]*k+v*(1-k);return v}
 function rsi(a,p=14){if(a.length<=p)return null;let g=0,l=0;for(let i=a.length-p;i<a.length;i++){let d=a[i]-a[i-1];if(d>0)g+=d;else l-=d}return l===0?100:100-100/(1+g/l)}
