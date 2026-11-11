@@ -37,7 +37,9 @@ function connect(){
   if(active!==socket)return;if(connectTimer)clearTimeout(connectTimer);connectTimer=null;retry=0;lastMessageAt=Date.now();
   status('CONNECTED · REQUESTING DATA',true);detail('Secure connection established. Requesting R_75 candles for 8 timeframes…');
   send({ping:1});
-  TF.forEach(([name,gran],i)=>setTimeout(()=>{if(active===socket&&active.readyState===1)send({ticks_history:'R_75',adjust_start_time:1,count:350,end:'latest',style:'candles',granularity:gran,subscribe:1,req_id:++req})},i*250));
+  // Subscribe to live R_75 ticks independently of candle-history requests.
+  send({ticks:'R_75',subscribe:1,req_id:++req});
+  TF.forEach(([name,gran],i)=>setTimeout(()=>{if(active===socket&&active.readyState===1)send({ticks_history:'R_75',adjust_start_time:1,count:350,end:'latest',style:'candles',granularity:gran,subscribe:1,req_id:++req})},i*350));
   pingTimer=setInterval(()=>{if(active===socket&&active.readyState===1)send({ping:1})},12000);
   watchTimer=setInterval(()=>{if(active!==socket||paused)return;if(Date.now()-lastMessageAt>35000){detail('No server response for 35 seconds. Reconnecting…');try{active.close()}catch(e){scheduleRetry('Server response timeout')}}},10000);
  };
@@ -47,7 +49,7 @@ function connect(){
   if(d.msg_type==='ping'||d.ping)detail('Deriv server is responding. Waiting for market candles…');
   if(d.candles){let g=Number(d.echo_req&&d.echo_req.granularity),tf=TF.find(x=>x[1]===g);if(tf)feed[tf[0]]=d.candles.map(c=>({t:+c.epoch,o:+c.open,h:+c.high,l:+c.low,c:+c.close}));let loaded=Object.keys(feed).length;status('CONNECTED · '+loaded+'/8 TF',true);detail(loaded+'/8 timeframe histories received. '+(loaded===8?'Market history loaded.':'Loading remaining timeframes…'));render()}
   if(d.ohlc){let tf=TF.find(x=>x[1]===Number(d.ohlc.granularity));if(tf){let a=feed[tf[0]]||(feed[tf[0]]=[]),c=d.ohlc,v={t:+c.open_time,o:+c.open,h:+c.high,l:+c.low,c:+c.close},i=a.findIndex(x=>x.t===v.t);if(i>=0)a[i]=v;else a.push(v);if(a.length>500)a.shift();render()}}
-  if(d.tick){lastTick=+d.tick.quote;$('price').textContent=fmt(lastTick);$('updated').textContent=new Date().toLocaleTimeString();status('LIVE · R_75',true);detail('Live R_75 tick received. '+Object.keys(feed).length+'/8 timeframe histories loaded.')}
+  if(d.tick){lastTick=+d.tick.quote;$('price').textContent=fmt(lastTick);$('updated').textContent=new Date().toLocaleTimeString();status('LIVE · R_75',true);detail('Live R_75 price stream active. '+Object.keys(feed).length+'/8 timeframe histories loaded.')}
  };
  socket.onerror=()=>{if(active!==socket)return;status('NETWORK ERROR');detail('WebSocket network error. Android or the current network may be blocking the secure connection.')};
  socket.onclose=e=>{if(active!==socket||paused)return;stopTimers();let reason=e.reason?(' · '+e.reason):'';let msg='Connection closed (code '+e.code+reason+').';status('DISCONNECTED');detail(msg);scheduleRetry(msg)};
