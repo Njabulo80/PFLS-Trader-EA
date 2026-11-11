@@ -1,0 +1,36 @@
+plugins { id 'com.android.application' }
+
+def buildNo = System.getenv("GITHUB_RUN_NUMBER") ?: "1"
+def signingReady = System.getenv("PFLS_KEYSTORE_BASE64") && System.getenv("PFLS_KEYSTORE_PASSWORD") && System.getenv("PFLS_KEY_ALIAS") && System.getenv("PFLS_KEY_PASSWORD")
+
+android {
+    namespace 'com.pfls.mobilepredictor'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.pfls.mobilepredictor'
+        minSdk 23
+        targetSdk 35
+        versionCode (buildNo as Integer)
+        versionName "1.0." + buildNo
+    }
+
+    signingConfigs {
+        if (signingReady) {
+            release {
+                storeFile file(System.getenv("KEYSTORE_FILE") ?: "pfls-release.jks")
+                storePassword System.getenv("PFLS_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("PFLS_KEY_ALIAS")
+                keyPassword System.getenv("PFLS_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (signingReady) signingConfig signingConfigs.release
+        }
+        debug { }
+    }
+}
