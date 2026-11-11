@@ -10,7 +10,7 @@
 <section class="card"><h2>Recent price references</h2><div class="grid"><div class="metric"><label>RECENT HIGH</label><strong id="high">—</strong></div><div class="metric"><label>RECENT LOW</label><strong id="low">—</strong></div><div class="metric"><label>M5 ATR</label><strong id="atr">—</strong></div><div class="metric"><label>M5 CLOSE</label><strong id="m5">—</strong></div></div><p class="note">Rolling highs/lows are reference levels, not confirmed supply/demand zones or guaranteed targets.</p></section>
 <section class="card"><div class="row"><h2>Prediction journal</h2><span id="count" class="pill">0 tracked</span></div><div class="row"><span class="muted">Resolved directional accuracy</span><b id="accuracy">Not enough results</b></div><div id="journal" class="note" style="margin-top:10px">No forecasts recorded yet.</div><div class="actions" style="margin-top:12px"><button class="secondary" id="export">Export CSV</button><button class="secondary" id="clear">Clear journal</button></div></section>
 <section class="card"><h2>App updates</h2><div id="version">PFLS Predictor 1.0</div><p class="note">Check GitHub for a newer signed APK. Android will ask you to approve installation; updates must use the same signing key.</p><button id="update" class="secondary" style="width:100%">Check for updates</button><div id="updateResult" class="note" style="margin-top:8px"></div></section>
-<section class="card"><h2>Connection configuration</h2><label class="note" for="appid">Deriv public app ID</label><input id="appid" value="1089" inputmode="numeric"><p class="note">No Deriv login or API token is requested. If the API rejects this public testing ID, enter an app ID registered to your own Deriv application.</p></section>
+<section class="card"><h2>Connection configuration</h2><label class="note" for="appid">Deriv public app ID</label><input id="appid" value="1089" inputmode="numeric"><p class="note">The current Deriv public market-data endpoint does not require a login, API token or legacy app ID. This field is retained for compatibility and is not used by the public connection.</p></section>
 <footer>PFLS MOBILE · RESEARCH ONLY · NO TRADE EXECUTION</footer></main>
 <script>
 (()=>{'use strict';
@@ -26,10 +26,9 @@ function scheduleRetry(reason){if(paused)return;stopTimers();status('RETRYING');
 function connect(){
  paused=false;stopTimers();if(socket){socket.onopen=socket.onmessage=socket.onerror=socket.onclose=null;try{socket.close()}catch(e){}}
  feed={};lastTick=null;$('price').textContent='—';$('updated').textContent='—';$('ladder').innerHTML='<tr><td colspan="3">Waiting for Deriv candle history…</td></tr>';
- status('CONNECTING');detail('Opening secure connection to ws.derivws.com…');
+ status('CONNECTING');detail('Opening Deriv public market-data connection…');
  let appid=$('appid').value.trim()||'1089';
- if(!/^\d+$/.test(appid)){status('INVALID APP ID');detail('Enter a numeric Deriv application ID, then tap Reconnect.');return}
- try{socket=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id='+encodeURIComponent(appid))}
+ try{socket=new WebSocket('wss://api.derivws.com/trading/v1/options/ws/public')}
  catch(e){status('SOCKET ERROR');detail('Could not create WebSocket: '+e.message);scheduleRetry('Socket creation failed');return}
  const active=socket;
  connectTimer=setTimeout(()=>{if(active===socket&&active.readyState!==1){detail('Timed out before Deriv accepted the connection. Check network restrictions, VPN or Private DNS.');try{active.close()}catch(e){}scheduleRetry('Connection timeout')}},15000);
