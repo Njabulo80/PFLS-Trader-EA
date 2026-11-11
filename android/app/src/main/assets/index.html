@@ -51,7 +51,7 @@ function connect(){
   if(d.error){let msg=(d.error.code?d.error.code+': ':'')+(d.error.message||'Unknown API error');status('API ERROR');detail(msg+' · Check the app ID and Deriv API availability.');return}
   if(d.msg_type==='ping'||d.ping)detail('Deriv server is responding. Waiting for market candles…');
   if(d.candles){let g=Number(d.echo_req&&d.echo_req.granularity),tf=TF.find(x=>x[1]===g&&x[0]!=='W1');if(tf)feed[tf[0]]=d.candles.map(c=>({t:+c.epoch,o:+c.open,h:+c.high,l:+c.low,c:+c.close}));if(tf&&tf[0]==='D1')buildWeekly();let loaded=Object.keys(feed).length;status('CONNECTED · '+loaded+'/8 TF',true);detail(loaded+'/8 timeframe histories received. '+(loaded===8?'Market history loaded.':'Loading remaining timeframes…'));render()}
-  if(d.ohlc){let tf=TF.find(x=>x[1]===Number(d.ohlc.granularity));if(tf){let a=feed[tf[0]]||(feed[tf[0]]=[]),c=d.ohlc,v={t:+c.open_time,o:+c.open,h:+c.high,l:+c.low,c:+c.close},i=a.findIndex(x=>x.t===v.t);if(i>=0)a[i]=v;else a.push(v);if(a.length>500)a.shift();render()}}
+  if(d.ohlc){let tf=TF.find(x=>x[1]===Number(d.ohlc.granularity));if(tf){let a=feed[tf[0]]||(feed[tf[0]]=[]),c=d.ohlc,v={t:+c.open_time,o:+c.open,h:+c.high,l:+c.low,c:+c.close},i=a.findIndex(x=>x.t===v.t);if(i>=0)a[i]=v;else a.push(v);if(a.length>500)a.shift();if(tf[0]==='D1')buildWeekly();render()}}
   if(d.tick){lastTick=+d.tick.quote;$('price').textContent=fmt(lastTick);$('updated').textContent=new Date().toLocaleTimeString();status('LIVE · R_75',true);detail('Live R_75 price stream active. '+Object.keys(feed).length+'/8 timeframe histories loaded.')}
  };
  socket.onerror=()=>{if(active!==socket)return;status('NETWORK ERROR');detail('WebSocket network error. Android or the current network may be blocking the secure connection.')};
